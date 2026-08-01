@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ct"
+version = "0.1.0"
+description = "FFT identification + EKF tracking of respiratory motion for needle-insertion gating"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pandas",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+ct-generate = "ct.cli.generate:main"
+ct-identify = "ct.cli.identify:main"
+ct-track = "ct.cli.track:main"
+ct-pipeline = "ct.cli.pipeline:main"
+ct-sweep-horizon = "ct.cli.sweep_horizon:main"
+ct-validate-k = "ct.cli.validate_k:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]

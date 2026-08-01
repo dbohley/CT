@@ -1,0 +1,13 @@
+name: CT
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - pyyaml
+  - pytest
+# After creating the env, install this package in editable mode:
+#   conda activate CT && pip install -e .

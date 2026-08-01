@@ -1,0 +1,44 @@
+# RC-piecewise chest-wall model at a 99.9% energy threshold, which selects K=4.
+#
+# The counterpart to rc_piecewise.yaml: same signal, tighter K rule. Tracking
+# RMSE drops from 0.439 to 0.108 against an injected noise_std of 0.15, i.e. the
+# filter goes from three times worse than the noise to below it.
+#
+# Kept as a separate config rather than changing the default, because the 95%
+# rule is the settled decision and is correct for the Lujan family. What this
+# pair shows is that the threshold is waveform-dependent, and should be
+# re-validated on real data rather than assumed.
+name: rc_piecewise_k4
+duration: 300.0
+fs: 50.0
+calib_seconds: 90.0
+horizon: 0.25
+seed: 0
+
+source:
+  name: rc_piecewise
+  params:
+    t1: 1.6
+    t2: 2.4
+    R_rs: 2.0
+    C_rs: 0.5
+    tau: 0.4
+    a0: 1.0
+    a1: 0.6
+    a2: -0.35
+    amplitude: 10.0
+    noise_std: 0.15
+    cardiac: false
+
+identifier:
+  name: fft_harmonic
+  params:
+    Kmax: 10
+    energy_threshold: 0.999
+    p0_inflation: 2.0
+
+tracker:
+  name: harmonic_ekf
+  params:
+    joseph: true
+    wrap_phases: true

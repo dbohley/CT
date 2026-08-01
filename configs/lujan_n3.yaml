@@ -1,0 +1,31 @@
+# Lujan cos^{2n} model, n=3. Three true harmonics are present, but the third
+# carries under 0.4% of the energy, so the 95% rule is expected to pick K = 2.
+name: lujan_n3
+duration: 300.0
+fs: 50.0
+calib_seconds: 90.0
+horizon: 0.25
+seed: 0
+
+source:
+  name: lujan
+  params:
+    breaths_per_min: 15.0
+    n: 3
+    a: 10.0
+    b: 0.0
+    phi: 0.0
+    noise_std: 0.15
+
+identifier:
+  name: fft_harmonic
+  params:
+    Kmax: 8
+    energy_threshold: 0.95
+    p0_inflation: 2.0
+
+tracker:
+  name: harmonic_ekf
+  params:
+    joseph: true
+    wrap_phases: true

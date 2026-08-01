@@ -1,0 +1,41 @@
+# Frequency-tracking stress case: omega_r ramps ~15 -> ~16 breaths/min over the
+# record, so the EKF's omega state has something real to follow.
+#
+# KNOWN CAVEAT, and the reason this is a separate config: identification fits the
+# whole calibration window at ONE fixed omega, so a drifting fundamental inflates
+# the Stage-1 residual variance. With R taken from that residual (the documented
+# fallback, an upper bound only) the filter ends up over-trusting its model and
+# the NIS drops far below 1 -- measured at ~0.027 in the bootstrap session.
+#
+# This is the failure mode that makes a breath-hold segment the preferred source
+# of R. Set identifier.params.breath_hold_window once real data has a still
+# segment to measure.
+name: sinusoid_ramp
+duration: 300.0
+fs: 50.0
+calib_seconds: 90.0
+horizon: 0.25
+seed: 0
+
+source:
+  name: sinusoid
+  params:
+    breaths_per_min: 15.0
+    amplitudes: [10.0, 3.0]
+    phases: [0.0, 1.1]
+    a0: 0.0
+    noise_std: 0.15
+    omega_ramp: 0.00035   # rad/s per second
+
+identifier:
+  name: fft_harmonic
+  params:
+    Kmax: 8
+    energy_threshold: 0.95
+    p0_inflation: 2.0
+
+tracker:
+  name: harmonic_ekf
+  params:
+    joseph: true
+    wrap_phases: true

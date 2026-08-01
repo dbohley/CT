@@ -1,0 +1,53 @@
+# Singh et al. 2020 RC-circuit chest-wall model — the hardest synthetic case.
+# Two-phase hybrid dynamics with a kink at the inhale/exhale transition.
+# t1 + t2 = 4.0 s => 15 breaths/min.
+#
+# This config keeps the settled 95% energy rule so the rule's behaviour on this
+# model is visible rather than tuned away. MEASURED IN THE BOOTSTRAP SESSION:
+#
+#   threshold   K   tracking RMSE   (injected noise_std = 0.15)
+#   0.95        1   0.439
+#   0.99        2   0.289
+#   0.999       4   0.108
+#
+# So the kink does slow the Fourier decay — not by making 95% pick a large K
+# (energy is concentrated in the fundamental), but by leaving real waveform
+# structure unmodelled at that threshold. Unlike Lujan, whose series terminates
+# exactly at k=n, this model's coefficients never reach zero. Ljung-Box on the
+# innovations rejects whiteness at every K tried, which is the tell.
+#
+# See rc_piecewise_k4.yaml for the threshold that actually tracks this waveform.
+name: rc_piecewise
+duration: 300.0
+fs: 50.0
+calib_seconds: 90.0
+horizon: 0.25
+seed: 0
+
+source:
+  name: rc_piecewise
+  params:
+    t1: 1.6            # inhale duration [s]
+    t2: 2.4            # exhale duration [s]
+    R_rs: 2.0          # respiratory resistance
+    C_rs: 0.5          # respiratory compliance  (tau_rs = R_rs*C_rs = 1.0 s)
+    tau: 0.4           # exhale pressure decay constant [s], must differ from tau_rs
+    a0: 1.0            # isometric pressure pulse: P(t) = a0 + a1 t + a2 t^2
+    a1: 0.6
+    a2: -0.35
+    amplitude: 10.0    # peak-to-peak chest-wall displacement
+    noise_std: 0.15
+    cardiac: false     # small Van der Pol component; enable to test for leakage
+
+identifier:
+  name: fft_harmonic
+  params:
+    Kmax: 10
+    energy_threshold: 0.95
+    p0_inflation: 2.0
+
+tracker:
+  name: harmonic_ekf
+  params:
+    joseph: true
+    wrap_phases: true
