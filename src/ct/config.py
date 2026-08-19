@@ -37,6 +37,16 @@ class RunConfig:
     )
     tracker: dict[str, Any] = field(default_factory=lambda: {"name": "harmonic_ekf", "params": {}})
 
+    # -- rig controller (session 002) -----------------------------------------
+    # Optional, and `None` by default, so every estimator-only config predating the
+    # hardware layer stays valid. Typed views are built at use time in `ct.hw.config`;
+    # keeping them as plain dicts here is what lets `--set rig.buses.sensing.channel=can1`
+    # keep working through `apply_overrides` without a schema round-trip.
+    rig: dict[str, Any] | None = None
+    procedure: dict[str, Any] | None = None
+    latency: dict[str, Any] | None = None
+    servo: dict[str, Any] | None = None
+
     output_dir: str | None = None
 
     def __post_init__(self) -> None:
@@ -86,6 +96,18 @@ class RunConfig:
             if "name" not in spec:
                 raise ValueError(f"config section '{key}' needs a 'name'")
             spec.setdefault("params", {})
+        # The rig sections are validated properly when their typed views are built, in
+        # `ct.hw.config`. All that is checked here is shape, so that a mistyped
+        # `--set rig=nonsense` fails at parse time rather than three states into a run.
+        for key in ("rig", "procedure", "latency", "servo"):
+            spec = getattr(self, key)
+            if spec is not None and not isinstance(spec, dict):
+                raise ValueError(f"config section '{key}' must be a mapping, got {type(spec).__name__}")
+
+    @property
+    def has_rig(self) -> bool:
+        """Whether this config describes a physical rig as well as an estimator run."""
+        return self.rig is not None
 
     # -- overriding -----------------------------------------------------------
 

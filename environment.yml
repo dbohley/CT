@@ -11,3 +11,9 @@ dependencies:
   - pytest
 # After creating the env, install this package in editable mode:
 #   conda activate CT && pip install -e .
+#
+# To talk to the real USB-CAN-FD RH02 adapter, add the optional CAN extra:
+#   pip install -e ".[can]"
+# It is deliberately optional: simulation and the entire test suite run without it, so a
+# machine that has never had a CAN adapter attached can still develop and test the rig
+# controller end to end.

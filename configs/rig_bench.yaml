@@ -1,0 +1,222 @@
+# The real rig. This is the file you edit as measurements come in.
+#
+# Identical in structure to rig_sim.yaml; the only substantive difference is
+# `backend: rh02` on both buses. Everything else is the same schema, which is the point --
+# switching from simulation to hardware is this one field, not a code change.
+#
+# Every value below is a PLACEHOLDER until someone measures it. A run with `rh02` backends
+# refuses to start while a placeholder still blocks a state it intends to enter:
+#
+#     ct-unknowns --check rig_bench      what is still a guess
+#     ct-unknowns --format md            the list to hand round the team
+#
+# Bring-up order, roughly:
+#   1. `python -m can.detect_available_configs` with the RH02 plugged in -> interface/channel
+#   2. `python -m can.viewer -i <interface> -c <channel>` -> confirm frames, find node IDs
+#   3. `ct-rig --config rig_bench --dry-run` -> exercises bus, codecs and geometry with
+#      every motor command suppressed. Run this before anything is allowed to move.
+#   4. Measure counts_per_mm and the offsets, fill them in, drop --dry-run.
+
+name: rig_bench
+duration: 900.0
+fs: 100.0
+calib_seconds: 60.0
+horizon: 0.25
+seed: 0
+
+# Only used to seed the phantom driver; the controller reads the real sensor.
+source:
+  name: sinusoid
+  params:
+    breaths_per_min: 15.0
+    amplitudes: [5.0, 1.2]
+    phases: [0.0, 1.1]
+    noise_std: 0.0
+
+identifier:
+  name: fft_harmonic
+  params:
+    Kmax: 6
+    energy_threshold: 0.95
+    p0_inflation: 2.0
+
+tracker:
+  name: harmonic_ekf
+  params:
+    joseph: true
+    wrap_phases: true
+
+rig:
+  buses:
+    sensing:
+      backend: rh02
+      interface: socketcan     # UNKNOWN -- socketcan on Linux, a vendor backend on Windows
+      channel: can0            # UNKNOWN
+      bitrate: 1000000         # CubeMars AK is classic CAN 2.0 at 1 Mbit/s
+      fd: false                # the RH02 is FD-capable; the motors are not. Leave false.
+    phantom:
+      backend: rh02
+      interface: socketcan
+      channel: can1            # the second adapter, or the second channel of a dual
+      bitrate: 1000000
+      fd: false
+
+  motors:
+    base:
+      bus: sensing
+      codec: cubemars_servo    # long travel needs servo mode's int32 position field
+      can_id: 1                # UNKNOWN
+      gear_ratio: 9.0          # UNKNOWN -- AK80-9 is 9, AK70-10 is 10, AK80-64 is 64
+      status_rate_hz: 200.0
+      stale_after_s: 0.1
+      limits: {tau_max: 2.0, v_max: 20.0, i_max: 20.0}
+      gains: {kp: 50.0, kd: 2.0}
+      float_gains: {kp: 0.0, kd: 0.1}
+    needle:
+      bus: sensing
+      codec: cubemars_mit      # MIT mode, because ADVANCE needs zero-stiffness float
+      can_id: 2                # UNKNOWN
+      gear_ratio: 9.0
+      status_rate_hz: 200.0
+      stale_after_s: 0.1
+      limits: {tau_max: 2.0, v_max: 20.0, i_max: 20.0}
+      gains: {kp: 50.0, kd: 2.0}
+      float_gains: {kp: 0.0, kd: 0.1}   # UNKNOWN -- kd found by sweeping it in a phantom
+      # Check travel_mm * counts_per_mm fits inside p_min..p_max, or commands saturate
+      # silently. The axis refuses to build if it does not.
+      codec_params: {p_min: -12.5, p_max: 12.5}
+    phantom:
+      bus: phantom
+      codec: cubemars_servo
+      can_id: 1
+      gear_ratio: 9.0
+      status_rate_hz: 200.0
+      stale_after_s: 0.1
+      limits: {tau_max: 6.0, v_max: 40.0, i_max: 20.0}
+      gains: {kp: 100.0, kd: 4.0}
+      float_gains: {kp: 0.0, kd: 0.5}
+
+  sensors:
+    tactile:
+      bus: sensing
+      can_id: 256              # UNKNOWN
+      rate_hz: 100.0           # UNKNOWN -- this is the estimator's sample rate
+      stale_after_s: 0.1
+      latency_s: 0.02          # UNKNOWN -- measure it with ct-compare
+      layout: {offset: 0, length: 2, byteorder: little, signed: false, scale: 1.0}  # UNKNOWN
+    tof:
+      bus: sensing
+      can_id: 257              # UNKNOWN
+      rate_hz: 100.0
+      stale_after_s: 0.2
+      latency_s: 0.0
+      layout: {offset: 0, length: 2, byteorder: little, signed: false, scale: 1.0}  # UNKNOWN
+
+  geometry:
+    # Every number in this block is a physical measurement. See `ct-unknowns --format md`
+    # for how to take each one.
+    base:
+      counts_per_mm: 100.0     # UNKNOWN -- degrees of output shaft per mm (servo codec)
+      direction: 1             # UNKNOWN -- +1 if increasing position moves toward phantom
+      zero_offset_counts: 0.0
+      travel_mm: [0.0, 200.0]  # UNKNOWN -- from the hard stops, backed off a few mm
+      v_max_mm_s: 30.0
+      a_max_mm_s2: 300.0
+    needle:
+      counts_per_mm: 200.0     # UNKNOWN -- radians per mm (MIT codec). Different units!
+      direction: 1             # UNKNOWN
+      zero_offset_counts: 0.0
+      travel_mm: [0.0, 80.0]   # UNKNOWN
+      v_max_mm_s: 60.0
+      a_max_mm_s2: 800.0
+
+    tof_offset_mm: -10.0        # UNKNOWN
+    tactile_offset_mm: 0.0      # UNKNOWN -- the datum everything else is measured against
+    needle_tip_offset_mm: -20.0 # UNKNOWN -- the one everyone asks for first
+    needle_free_length_mm: 100.0
+
+    tactile_counts_to_mm: 0.01  # UNKNOWN -- the single most load-bearing number here
+    tactile_contact_counts: 50.0
+    tactile_saturation_mm: 20.0 # must exceed the full breathing excursion, or APPROACH
+                                # can never find an unclipped seating depth
+    tof_counts_to_mm: 1.0
+    tof_range_mm: [10.0, 1000.0]
+
+procedure:
+  loop_rate_hz: 200.0          # UNKNOWN -- raise until deadline misses appear, then back off
+
+  approach:
+    coarse_standoff_mm: 30.0
+    coarse_speed_mm_s: 10.0    # start slow on real hardware
+    creep_speed_mm_s: 1.0
+    creep_increment_mm: 0.5
+    min_breaths: 2.0
+    amplitude_tol_mm: 0.2
+    stable_increments: 2
+    max_seat_increments: 40
+    standoff_mm: 2.0
+    # Worth turning on. A breath hold here is nearly free -- the base is parked and the
+    # sensor is already seated -- and gives Stage 1 an honest R instead of the
+    # residual-variance upper bound that collapses NIS to ~0.027. See CLAUDE.md.
+    breath_hold_s: 15.0
+    nominal_breath_s: 4.0
+    timeout_s: 600.0
+
+  estimate:
+    calib_seconds: 60.0
+    settle_breaths: 3.0
+    nis_band: [0.2, 3.0]
+    nis_window: 200
+    max_forecast_std_mm: 1.0
+    timeout_s: 400.0
+
+  insert:
+    initial_depth_mm: 10.0     # UNKNOWN
+    drive_speed_mm_s: 30.0
+    exhale_band_frac: 0.15
+    max_forecast_std_mm: 0.5   # UNKNOWN -- a fraction of the clinical tolerance
+    arrival_tol_mm: 0.5        # cannot be tighter than the load/kp steady-state error
+    stall_velocity_mm_s: 0.3
+    stall_time_s: 0.4
+    track_standoff: true
+    timeout_s: 180.0
+
+  advance:
+    total_depth_mm: 40.0       # UNKNOWN -- clinical
+    increment_mm: 2.0          # UNKNOWN
+    increment_speed_mm_s: 15.0
+    exhale_band_frac: 0.15
+    max_forecast_std_mm: 0.5
+    settle_s: 0.3
+    max_increments: 60
+    timeout_s: 900.0
+
+  safety:
+    max_tactile_mm: 15.0
+    watchdog_s: 0.2
+    max_nis: 25.0
+    nis_trip_count: 10
+    max_deadline_misses: 50
+    require_contact_to_insert: true
+
+  clinical:
+    tolerance_mm: 2.0          # UNKNOWN -- from the clinical collaborators
+    target_amplitude_mm: 20.0  # UNKNOWN
+
+  withdraw_speed_mm_s: 15.0
+  retract_speed_mm_s: 15.0
+
+latency:
+  tau_s: 0.02                  # UNKNOWN -- measure with ct-compare
+  tau_c: 0.005                 # measured by the loop itself once running
+  T_ins: 0.15                  # UNKNOWN -- time a real insertion from the telemetry
+  tau_cl_fallback: 0.05        # only used if no servo design is configured
+  measure_tau_c: true
+
+servo:
+  needle:
+    # UNKNOWN -- both blocks. Identify the plant from a step response on the real needle
+    # axis, then design the lead against it rather than hand-tuning. tau_cl comes out of
+    # the resulting closed loop, so a wrong plant here means a wrong forecast horizon.
+    plant: {K: 1.0, wn: 60.0, zeta: 0.7}
+    lead: {zero: 8.0, pole: 80.0, gain: 150.0}

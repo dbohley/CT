@@ -17,6 +17,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+# Only needed to talk to a real adapter. Simulation, and the whole test suite, run
+# without it -- which is what keeps CI and a laptop with no CAN hardware working.
+can = ["python-can>=4.0"]
 
 [project.scripts]
 ct-generate = "ct.cli.generate:main"
@@ -25,6 +28,11 @@ ct-track = "ct.cli.track:main"
 ct-pipeline = "ct.cli.pipeline:main"
 ct-sweep-horizon = "ct.cli.sweep_horizon:main"
 ct-validate-k = "ct.cli.validate_k:main"
+ct-unknowns = "ct.cli.unknowns:main"
+ct-rig = "ct.cli.rig:main"
+ct-phantom = "ct.cli.phantom:main"
+ct-compare = "ct.cli.compare:main"
+ct-sensor-bench = "ct.cli.sensor_bench:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

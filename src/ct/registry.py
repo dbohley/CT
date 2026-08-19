@@ -15,6 +15,13 @@ SOURCES: dict[str, type] = {}
 IDENTIFIERS: dict[str, type] = {}
 TRACKERS: dict[str, type] = {}
 
+# Rig-controller boundaries (session 002). Same mechanism, one layer down: a bus, a motor
+# wire protocol or a procedure state is chosen by config string exactly as a tracker is.
+BUSES: dict[str, type] = {}
+CODECS: dict[str, type] = {}
+SENSORS: dict[str, type] = {}
+STATES: dict[str, type] = {}
+
 
 def _make_register(table: dict[str, type], kind: str) -> Callable[[str], Callable[[type], type]]:
     def register(name: str) -> Callable[[type], type]:
@@ -33,6 +40,11 @@ def _make_register(table: dict[str, type], kind: str) -> Callable[[str], Callabl
 register_source = _make_register(SOURCES, "source")
 register_identifier = _make_register(IDENTIFIERS, "identifier")
 register_tracker = _make_register(TRACKERS, "tracker")
+
+register_bus = _make_register(BUSES, "bus")
+register_codec = _make_register(CODECS, "codec")
+register_sensor = _make_register(SENSORS, "sensor")
+register_state = _make_register(STATES, "state")
 
 
 def _build(table: dict[str, type], kind: str, name: str, params: dict[str, Any] | None) -> Any:
@@ -54,10 +66,34 @@ def build_tracker(name: str, params: dict[str, Any] | None = None) -> Any:
     return _build(TRACKERS, "tracker", name, params)
 
 
+def build_bus(name: str, params: dict[str, Any] | None = None) -> Any:
+    return _build(BUSES, "bus", name, params)
+
+
+def build_codec(name: str, params: dict[str, Any] | None = None) -> Any:
+    return _build(CODECS, "codec", name, params)
+
+
+def build_sensor(name: str, params: dict[str, Any] | None = None) -> Any:
+    return _build(SENSORS, "sensor", name, params)
+
+
+def build_state(name: str, params: dict[str, Any] | None = None) -> Any:
+    return _build(STATES, "state", name, params)
+
+
 def available() -> dict[str, list[str]]:
-    """Registered names by kind — printed by the CLIs on an unknown name."""
+    """Registered names by kind — printed by the CLIs on an unknown name.
+
+    The rig kinds stay empty until ``ct.control`` is imported; the estimator does not
+    pull in the hardware layer, so ``import ct`` alone does not populate them.
+    """
     return {
         "sources": sorted(SOURCES),
         "identifiers": sorted(IDENTIFIERS),
         "trackers": sorted(TRACKERS),
+        "buses": sorted(BUSES),
+        "codecs": sorted(CODECS),
+        "sensors": sorted(SENSORS),
+        "states": sorted(STATES),
     }
