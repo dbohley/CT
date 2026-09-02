@@ -282,6 +282,56 @@ not really produced is worse than no session doc.
   the mode bits in the arbitration ID only take effect once the drive itself has been
   reconfigured via CubeMars's own software.
 
+### From phantom relative playback (sessions 010-011)
+
+- **The phantom breathes wherever it is parked, and the origin is COMMANDED, not read.**
+  `run_breathing_profile.py` sends `codec.zero()` (`CMD_SET_ORIGIN`, temporary) at startup so
+  the motor's present position *becomes* 0, then commands the profile's offsets literally.
+  Session 010 tried referencing a *read* position (`initial_rad + profile_offset`) and it still
+  traversed on hardware; commanding the origin leaves no reference number in the arithmetic to
+  be wrong. `scripts/test_phantom_motor.py --zero` has used this on this motor since session 004.
+- **The readback after zeroing is the safety check, and it is the right one.** The motor must
+  report ~0 within `ZERO_READBACK_TOL_MM`, because that is exactly the property playback
+  depends on: commanding position 0 must mean "stay put". If `SET_ORIGIN` silently fails the
+  motor still reports its old position and the run refuses rather than dragging the phantom
+  across the bench.
+- **`load_profile` rebases about the profile's mean, not its first sample.** Every recorded
+  profile starts near its top, so first-sample referencing would park the phantom 0.5-1.1mm
+  behind where you left it — the same magnitude that consumed the base's contact margin in
+  session 009.
+- **Do not reference two logged series to the same unverified number.** Session 010 subtracted
+  the read reference from both `commanded_mm` and `measured_mm`, so a wrong reference shifted
+  them together and made a real traverse invisible in the log. The measured series must stay in
+  the frame the hardware actually reports.
+- **Diagnostics belong in the `finally`.** The phantom's `summary.json` used to be built after
+  the `try/finally`, so any abnormal exit skipped it — and three runs on 2026-09-02 have none,
+  each missing the one number that would have diagnosed the traverse. The phantom subprocess's
+  stdout is likewise captured to `<out>/phantom/stdout.log` rather than lost to scrollback.
+- **A subprocess dying mid-run used to be invisible.** `run_approach_and_seat.py` now checks
+  `phantom_proc.poll()` every tick. Without it the base keeps seating and standing off against
+  a stationary surface, and the run completes looking fine while measuring nothing.
+### From the tactile tare (session 012)
+
+- **The tactile firmware zero drifts ~0.008mm/hour and the signal itself is clean.** 0.0048mm
+  at rest on 2026-09-01 16:54, 0.1967mm on 2026-09-02 15:46 — a 40x creep — while its std
+  stayed at 0.002-0.014mm. Once it passed the fixed 0.1mm contact threshold, **every** run
+  declared contact on its first sample and had no APPROACH phase at all.
+  `run_approach_and_seat.py` now **tares per run**: 2s of stationary samples before any motion,
+  subtracted from the *signed* `dist_cm` before the magnitude is taken (the sign is arbitrary,
+  so subtracting after would fold a negative rest onto a positive one). Within-run drift is
+  ~0.0004mm, so a per-run zero is enough. **Any absolute threshold on this signal has a shelf
+  life** — this one lasted two days.
+- **That failure looked like success.** A run declaring contact at t=0.0002s reports
+  `phase_reached: seat` with no fault; only the missing `approach` phase gives it away.
+  Everything derived from such a run was measured from a datum never established.
+- **`bus.recv()` returns the OLDEST queued frame, so "command it, then read back to confirm"
+  is a trap on this bus.** After a 0.5s settle at ~51Hz there are ~25 pre-command frames ahead
+  of the one that matters. Session 011's SET_ORIGIN check refused on exactly such a stale
+  frame. Flush before any confirmation read — `read_fresh_position_rad` does this.
+- **Capturing a subprocess's stdout paid for itself on the first run after it was added.**
+  Both session-011 phantom bugs were found in `phantom/stdout.log` and neither is visible in
+  the JSONL or the summary.
+
 ### From the approach travel-exhaustion fault (session 009)
 
 - **The rig ran on a 6% contact margin for its whole history and looked fine.** The one bench

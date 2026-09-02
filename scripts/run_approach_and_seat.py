@@ -126,6 +126,7 @@ import time
 from pathlib import Path
 
 import can
+import numpy as np
 
 from ct.cli._common import save_json
 from ct.control.live import AmplitudeWatcher
@@ -176,9 +177,19 @@ DEFAULT_MAX_APPROACH_MM = 100.0
 APPROACH_ARRIVAL_TOL_MM = 0.5  # settled position error is 0.006mm mean / 0.016mm max; while
 # still moving it is ~0.87mm. 0.5mm separates the two by more than an order of magnitude.
 APPROACH_BASELINE_S = 3.0  # pre-contact window used for the diagnostic baseline only
+# dist_cm is a signed float zeroed once at FIRMWARE boot, and that zero drifts: measured at
+# 0.0048mm resting on 2026-09-01 16:54 and 0.1967mm on 2026-09-02 15:46, a 40x creep over two
+# days, while its std stayed at 0.002-0.014mm. The reading is clean; the datum moves. Once the
+# drift passed the 0.1mm contact threshold every run declared contact on its first sample and
+# skipped APPROACH entirely. So the zero is measured per run instead of trusted from boot.
+DEFAULT_TARE_S = 2.0
+# A free arm sits still (p2p 0.014-0.10mm over such a window); an arm already riding the
+# breathing phantom swings with it (p2p 0.836mm measured during standoff_hold). Between those
+# is where "the tare is about to hide real contact" lives.
+TARE_CONTACT_P2P_MM = 0.3
 DEFAULT_VELOCITY_RAD_S = 0.1  # approach + retract velocity
 DEFAULT_CONTACT_THRESHOLD_CM = 0.01
-DEFAULT_STANDOFF_DIST_CM = 0.6  # empirical: needle (unactuated, fully retracted) sits close to but not touching skin here
+DEFAULT_STANDOFF_DIST_CM = .8  # empirical: needle (unactuated, fully retracted) sits close to but not touching skin here
 # Coarse continuous advance stops here, well short of the target, because an instantaneous
 # reading taken while moving understates the settled breathing peak by the swing plus the
 # viscoelastic rise (measured together at ~2.5mm in run 20260901-161845). Half the target
@@ -209,7 +220,12 @@ DEFAULT_RECORD_S = 180.0
 DEFAULT_MAX_RUNTIME_S = 900.0  # blanket safety watchdog; raised with --record-s above
 
 DEFAULT_PROFILE = "breathing_profile_1"
-PHANTOM_STARTUP_CHECK_S = 2.0  # give the subprocess time to fail fast (bad channel, etc.) before trusting it
+# Long enough to cover run_breathing_profile.py's slowest fail-fast path: interpreter start,
+# loading a 74k-row profile, opening the bus, enable + 0.5s, then its 2.0s position read before
+# it can refuse for want of a reference position. The old 2.0s expired while that read was
+# still in progress, so the parent saw a live process and drove into a test with no phantom.
+# The in-loop poll below is the real backstop; this only makes the common case fail cleanly.
+PHANTOM_STARTUP_CHECK_S = 6.0
 PHANTOM_SHUTDOWN_TIMEOUT_S = 20.0  # generous -- covers its own ramp-back-to-start before disabling
 BREATHING_PROFILE_SCRIPT = REPO_ROOT / "scripts" / "run_breathing_profile.py"
 
@@ -225,6 +241,48 @@ def build_pos_vel_frame(node_id: int, pos_rad: float, vel_rad_s: float) -> can.M
 
 def universal_command(node_id: int, cmd_bytes: bytes) -> can.Message:
     return can.Message(arbitration_id=pos_vel_can_id(node_id), data=cmd_bytes, is_extended_id=False)
+
+
+class SetupFailed(RuntimeError):
+    """A pre-motion check failed. Carried by ``fault_reason`` and reported like any fault.
+
+    Raised rather than returned so it unwinds to the same ``finally`` that de-energises the
+    motor and stops the phantom, and still reaches the summary -- a bare ``raise`` would skip
+    the summary, which is the mistake session 011 had to fix on the phantom side.
+    """
+
+
+def measure_tactile_zero(sensor_bus, duration_s: float) -> dict:
+    """Sample the tactile reading with the base stationary, to establish this run's zero.
+
+    Returns the raw signed ``dist_cm`` statistics -- signed, because the sign of ``dist_cm``
+    is documented as arbitrary and the deflection that matters is ``|dist_cm - zero|`` in
+    either direction. Taking the magnitude first would fold a negative rest position onto a
+    positive one and make the tare wrong.
+
+    Must be called before any motion is commanded: the whole point is to capture the arm at
+    rest, and a moving base contaminates it immediately.
+    """
+    samples: list[float] = []
+    deadline = time.monotonic() + duration_s
+    while time.monotonic() < deadline:
+        for _stamp, can_id, data in sensor_bus.poll():
+            if can_id != SENSOR_CAN_ID or len(data) < _PAYLOAD.size:
+                continue
+            _tof_mm, dist_cm, _angle = _PAYLOAD.unpack(data[: _PAYLOAD.size])
+            samples.append(float(dist_cm))
+        time.sleep(0.005)
+
+    if not samples:
+        return {"n": 0, "zero_cm": 0.0, "zero_mm": 0.0, "std_mm": None, "p2p_mm": None}
+    values = np.array(samples, dtype=float)
+    return {
+        "n": int(values.size),
+        "zero_cm": float(values.mean()),
+        "zero_mm": float(values.mean()) * 10.0,
+        "std_mm": float(values.std()) * 10.0,
+        "p2p_mm": float(values.max() - values.min()) * 10.0,
+    }
 
 
 def confirm(prompt: str) -> bool:
@@ -290,6 +348,12 @@ def main() -> int:
                          help="passed through to run_breathing_profile.py; overrides its own "
                               "default (6.0mm) if the profile's peak-to-peak travel needs more "
                               "(e.g. moira_normal_breathing at 7.88mm, sara at 9.03mm)")
+    parser.add_argument("--tare-s", type=float, default=DEFAULT_TARE_S, dest="tare_s",
+                         help="seconds of stationary tactile samples taken before any motion, "
+                              "used as this run's zero. The firmware zero drifts between runs")
+    parser.add_argument("--no-tare", dest="tare", action="store_false",
+                         help="use the raw firmware zero instead of taring -- the pre-2026-09-02 "
+                              "behaviour, kept for comparison")
     parser.add_argument("--no-phantom", action="store_true", dest="no_phantom",
                          help="don't drive the phantom -- base motor + sensors only")
     parser.add_argument("--out", type=Path, default=None,
@@ -362,6 +426,7 @@ def main() -> int:
         return 1
 
     phantom_proc: subprocess.Popen | None = None
+    phantom_log = None
     if not args.no_phantom:
         phantom_out_dir = out_dir / "phantom"
         phantom_cmd = [sys.executable, str(BREATHING_PROFILE_SCRIPT),
@@ -369,11 +434,21 @@ def main() -> int:
         if args.max_travel_mm is not None:
             phantom_cmd += ["--max-travel-mm", str(args.max_travel_mm)]
         print(f"launching phantom: {args.profile} (looped), logging to {phantom_out_dir}...")
-        phantom_proc = subprocess.Popen(phantom_cmd)
+        # Capture the subprocess's output to a file rather than letting it scroll past in the
+        # shared terminal. The phantom prints the one thing needed to diagnose a bad startup
+        # move -- where it thought the motor was, and whether SET_ORIGIN took -- and on
+        # 2026-09-02 that line was lost to scrollback while a traverse went unexplained.
+        phantom_out_dir.mkdir(parents=True, exist_ok=True)
+        phantom_log = open(phantom_out_dir / "stdout.log", "w")
+        phantom_proc = subprocess.Popen(phantom_cmd, stdout=phantom_log,
+                                         stderr=subprocess.STDOUT)
         time.sleep(PHANTOM_STARTUP_CHECK_S)
         if phantom_proc.poll() is not None:
-            print(f"error: run_breathing_profile.py exited immediately (code {phantom_proc.returncode}) "
-                  f"-- not proceeding into a test with no real phantom signal. Check its output above.")
+            phantom_log.close()
+            print(f"error: run_breathing_profile.py exited (code {phantom_proc.returncode}) before "
+                  f"the run started -- not proceeding into a test with no real phantom signal. "
+                  f"Its output:")
+            print("  " + (phantom_out_dir / "stdout.log").read_text().strip().replace("\n", "\n  "))
             return 1
 
     def stop_phantom() -> None:
@@ -389,6 +464,8 @@ def main() -> int:
                     phantom_proc.wait(timeout=5.0)
                 except subprocess.TimeoutExpired:
                     phantom_proc.kill()
+        if phantom_log is not None and not phantom_log.closed:
+            phantom_log.close()
 
     # Bus/writer setup deliberately guarded on its own -- a failure here (bad channel, port
     # busy) must not leave the just-launched phantom subprocess running unsupervised, since
@@ -427,6 +504,10 @@ def main() -> int:
     approach_extending = False
     approach_peak_deflection_mm = 0.0
     approach_baseline: list[float] = []
+    approach_baseline_warned = False
+    tare: dict | None = None
+    tactile_zero_cm = 0.0   # 0.0 means "untared", i.e. the raw firmware zero
+    tare_contact_warned = False
     watcher = AmplitudeWatcher(window_s=window_s)
     increments = 0
     stable_count = 0
@@ -511,6 +592,30 @@ def main() -> int:
         motor_bus.send(universal_command(MOTOR_NODE_ID, ENTER_MODE))
         time.sleep(0.5)
 
+        # Establish this run's tactile zero BEFORE anything moves. The firmware zero drifts
+        # (see DEFAULT_TARE_S), and once it passed the contact threshold every run declared
+        # contact on its first sample and never had an approach phase at all.
+        if args.tare:
+            print(f"taring the tactile sensor over {args.tare_s:.1f}s (base stationary)...")
+            tare = measure_tactile_zero(sensor_bus, args.tare_s)
+            if tare["n"] == 0:
+                fault_reason = (
+                    f"no tactile samples in {args.tare_s:.1f}s of taring -- the sensor is not "
+                    f"reporting on CAN id {SENSOR_CAN_ID}, so nothing this run measures would "
+                    f"mean anything. Check the sensor bus."
+                )
+                raise SetupFailed
+            tactile_zero_cm = tare["zero_cm"]
+            print(f"  zero = {tare['zero_mm']:+.4f}mm  (std {tare['std_mm']:.4f}, "
+                  f"p2p {tare['p2p_mm']:.4f}mm, {tare['n']} samples)")
+            if tare["p2p_mm"] > TARE_CONTACT_P2P_MM:
+                tare_contact_warned = True
+                print(f"\n  WARNING: the arm is swinging {tare['p2p_mm']:.3f}mm over the tare "
+                      f"window, above the {TARE_CONTACT_P2P_MM:.2f}mm expected of a free arm. "
+                      f"It looks like it is already riding the phantom's breathing, i.e. in "
+                      f"real contact -- and taring will zero that out, so the base will drive "
+                      f"in from an already-loaded state. Retract it if that is not intended.\n")
+
         t0 = time.monotonic()
         print("commanding approach...")
         motor_bus.send(build_pos_vel_frame(MOTOR_NODE_ID, current_target_rad, current_velocity_rad_s))
@@ -523,6 +628,18 @@ def main() -> int:
             elapsed = now - t0
             if elapsed >= args.max_runtime_s:
                 fault_reason = f"max-runtime watchdog ({args.max_runtime_s:.0f}s) exceeded in phase '{phase}'"
+                break
+
+            # A phantom that dies mid-run used to go entirely unnoticed: the base kept
+            # seating and standing off against a stationary surface, and the run looked
+            # successful while measuring nothing. Cheap to check, so check every tick.
+            if phantom_proc is not None and phantom_proc.poll() is not None:
+                fault_reason = (
+                    f"the phantom subprocess exited (code {phantom_proc.returncode}) during "
+                    f"phase '{phase}' at t={elapsed:.1f}s -- there is no breathing signal to "
+                    f"measure, so continuing would produce a run that looks fine and means "
+                    f"nothing. Check its output above."
+                )
                 break
 
             motor_msg = motor_bus.recv(timeout=0.0)
@@ -579,8 +696,13 @@ def main() -> int:
                 if can_id != SENSOR_CAN_ID or len(data) < _PAYLOAD.size:
                     continue
                 tof_mm, dist_cm, angle_centideg = _PAYLOAD.unpack(data[: _PAYLOAD.size])
-                tactile_mm = abs(dist_cm) * 10.0
-                in_contact = abs(dist_cm) > args.contact_threshold_cm
+                # Deflection from THIS run's measured rest, not from the firmware's boot-time
+                # zero. Subtracting before taking the magnitude is what makes it work in
+                # either direction, which matters because dist_cm's sign is arbitrary.
+                # tactile_zero_cm is 0.0 under --no-tare, so this reduces to the old form.
+                tactile_raw_mm = abs(dist_cm) * 10.0
+                tactile_mm = abs(dist_cm - tactile_zero_cm) * 10.0
+                in_contact = abs(dist_cm - tactile_zero_cm) > args.contact_threshold_cm
 
                 if phase == "approach":
                     # Diagnostics, recorded whatever the outcome. "how close did the arm get"
@@ -589,6 +711,21 @@ def main() -> int:
                     approach_peak_deflection_mm = max(approach_peak_deflection_mm, tactile_mm)
                     if elapsed < APPROACH_BASELINE_S:
                         approach_baseline.append(tactile_mm)
+                    if not approach_baseline_warned:
+                        approach_baseline_warned = True
+                        if in_contact:
+                            # dist_cm is zeroed once at firmware boot and drifts between runs
+                            # -- 0.002mm to 7.46mm across the runs of 2026-09-02. When it has
+                            # drifted past the threshold, contact fires on this very first
+                            # sample, there is no approach phase at all, and everything
+                            # downstream is measuring from a datum that was never established.
+                            # Run 20260902-151454 did exactly that at t=0.0003s and the base
+                            # then drove 42.7mm during standoff. Warning only, by choice.
+                            print(f"\nWARNING: tactile already reads {tactile_mm:.4f}mm, above the "
+                                  f"{args.contact_threshold_cm * 10.0:.3f}mm contact threshold, "
+                                  f"before any motion. The arm is pressed against something or the "
+                                  f"firmware zero has drifted. Contact will fire immediately and "
+                                  f"this run will have no real approach phase.\n")
 
                     if in_contact:
                         contact_t = elapsed
@@ -814,7 +951,12 @@ def main() -> int:
                     "elapsed": elapsed,
                     "tof_mm": tof_mm,
                     "dist_cm": dist_cm,
+                    # tactile_mm is the TARED deflection -- the decision variable, and what
+                    # the plots and ct-compare read. tactile_raw_mm is the old absolute form,
+                    # kept so a run can still be compared against ones recorded before the
+                    # firmware zero drifted, and so the drift itself stays visible.
                     "tactile_mm": tactile_mm,
+                    "tactile_raw_mm": tactile_raw_mm,
                     "angle_deg": angle_centideg / 100.0,
                     "in_contact": in_contact,
                     "phase": phase,
@@ -832,6 +974,8 @@ def main() -> int:
             time.sleep(0.005)
     except KeyboardInterrupt:
         print("\nstopped by Ctrl+C.")
+    except SetupFailed:
+        pass  # fault_reason is already set; reported and summarised below like any other fault
     finally:
         if motion_commanded:
             stop_motor("cleanup")
@@ -847,6 +991,25 @@ def main() -> int:
         "phase_reached": phase,
         "fault_reason": fault_reason,
         "contact_t": contact_t,
+        "tare": {
+            "applied": args.tare and tare is not None,
+            "window_s": args.tare_s if args.tare else None,
+            "zero_mm": (tare or {}).get("zero_mm"),
+            "std_mm": (tare or {}).get("std_mm"),
+            "p2p_mm": (tare or {}).get("p2p_mm"),
+            "samples": (tare or {}).get("n"),
+            "already_in_contact_warning": tare_contact_warned,
+            "note": (
+                "dist_cm is zeroed once at FIRMWARE boot and that zero drifts: 0.0048mm at "
+                "rest on 2026-09-01 16:54, 0.1967mm on 2026-09-02 15:46, while its std stayed "
+                "at 0.002-0.014mm. The reading is clean; the datum moves. Once the drift "
+                "passed the contact threshold, every run declared contact on its first sample "
+                "and had no APPROACH phase at all. zero_mm is what was subtracted this run. "
+                "A p2p above ~0.3mm over the tare window means the arm was already riding the "
+                "phantom's breathing -- i.e. in real contact, which the tare then hides; that "
+                "is warned about, not prevented."
+            ),
+        },
         "approach": {
             "travelled_mm": approach_travelled_mm,
             "initial_target_mm": args.travel_mm,
