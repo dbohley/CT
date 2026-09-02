@@ -42,6 +42,7 @@ from ct.hw.motors.cubemars_servo import CubeMarsServo
 
 # ---------------- Motor-specific config ----------------
 CAN_CHANNEL = "/dev/cu.usbmodem207635764E451"  # second CANable2 adapter -- confirm with `ls /dev/cu.*`
+CAN_CHANNEL = "/dev/cu.usbmodem20563976534B1"
 CAN_INTERFACE = "slcan"
 BITRATE = 1_000_000  # assumed, carried over from the needle/base scripts -- not independently confirmed
 

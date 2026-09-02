@@ -195,6 +195,18 @@ land in `outputs/<name>/`, alongside the resolved config that produced them.
 
 See [README.md](README.md) for worked examples of each.
 
+### Real subject data
+
+`unfiltered_data/` holds the raw OptiTrack takes (read-only; large). Each is a 70-column
+export at 120 Hz in which only the **nine `Unlabeled NNNN` markers** carry signal — the
+`tube` and `crab` rigid bodies are fixtures with all-zero position columns.
+[scripts/build_breathe_profiles.py](scripts/build_breathe_profiles.py) reduces a take to one
+`time_s,y_mm` trace by averaging those nine markers' Y position, and writes the result to
+`breathe_profiles/`. It selects marker columns from each file's own header, never by index,
+and its default `--verify` re-proves the reduction against
+`unfiltered_data/Moira_normal average marker motion.csv` on every run. Consume the output
+through the `csv` source with `t_column=time_s`, `y_column=y_mm`.
+
 ## Session workflow
 
 **At the end of every working session**, write a session document:
@@ -242,10 +254,125 @@ not really produced is worse than no session doc.
   stall detector — a tolerance the physics forbids just becomes a timeout.
 - **The tactile sensor's usable stroke must exceed the full breathing excursion**, or there
   is no seating depth at which the whole waveform is visible and APPROACH cannot succeed at
-  any tuning. A hardware sizing requirement, not a tuning problem.
+  any tuning. A hardware sizing requirement, not a tuning problem. Session 009 adds a second
+  term: excursion **plus** the ~1.5mm of slow baseline wander a real subject profile carries.
 - **A position axis is type-1.** Modelling the needle as a plain second-order lag gave a
   closed loop tracking 55% of its reference and *leading* rather than lagging, which
   silently clamped `tau_cl` to zero and dropped a term out of `h`.
+
+### From the bench (session 005)
+
+- **The Gimbal-protocol addressing needle/base already run is real, published CubeMars
+  documentation** — confirmed by fetching CubeMars's actual "Gimbal Motor Drive User
+  Manual — For GL II" (V1.0), closing an open question session 004 had left unresolved.
+  `(mode<<8)|node_id` + little-endian float32 position/velocity matches exactly.
+- **This motor's CAN feedback frame is a per-command ACK, not a continuous broadcast.**
+  One 19.6 s real run produced exactly 4 replies, landing within milliseconds of the 4
+  commands actually sent — not spread through the run. Sending commands more often (a
+  periodic resend, not one-shot) is what turns this into usable telemetry.
+- **A dead-reckoned position estimate (`velocity × elapsed_time` from move-start) drifts
+  from the real position by an amount worth caring about.** One real reply near a contact
+  event measured 0.17 rad (4.44 mm) less travel than dead reckoning assumed at t≈14.6 s —
+  consistent with the real acceleration ramp-up at the start of a move (documented to
+  exist, but with no quantified numbers) that constant-velocity dead reckoning ignores.
+  Prefer a real, recent reply plus a small residual correction over dead-reckoning the
+  whole elapsed time whenever real telemetry is available.
+- **Switching a GL-II drive's control mode (MIT / Position-Velocity / Velocity) is a
+  persistent, GUI-configured, power-cycle-requiring setting**, not a per-CAN-frame choice —
+  the mode bits in the arbitration ID only take effect once the drive itself has been
+  reconfigured via CubeMars's own software.
+
+### From the approach travel-exhaustion fault (session 009)
+
+- **The rig ran on a 6% contact margin for its whole history and looked fine.** The one bench
+  run that reached `standoff_hold` contacted at exactly its 40mm travel limit, with a peak
+  tactile reading of 0.00941 against a 0.01 threshold. Every conclusion drawn from bench runs
+  before session 009 rested on that margin holding. `--travel-mm` is now an *initial* target
+  that auto-extends to a `--max-approach-mm` cap, so running out of room is a named fault
+  rather than a timeout.
+- **Real subject profiles carry ~1.5mm of slow baseline wander; short looping profiles do
+  not.** `breathing_profile_1` is 14.8s and loops ~11 times per run, presenting a stationary
+  mean. Emma is 618s, completes *zero* loops in a 180s run, and the slice that plays sat ~1mm
+  further out (mean -0.140mm vs -1.098mm). That 1mm consumed the entire contact margin.
+  **Anything tuned against a short looping profile — seating depth, travel budget, standoff —
+  should be re-checked against a real one.**
+- **A grazing contact is distinguishable from a seated one, and 3.2 sigma is not enough.** At
+  the travel limit the deflection was 0.0246mm mean against a 0.0031 +- 0.0067mm baseline, and
+  the tactile arm saw 0.0417mm p2p of breathing while the ToF saw 12mm of the same motion. The
+  contact threshold was deliberately *not* lowered: the pre-contact maximum (0.0255mm) already
+  equalled the post-contact settled mean, so a threshold low enough to catch it would fire
+  first. Under-travel, not under-sensitivity.
+- **Never dead-reckon a travel limit.** Arrival is judged from the motor's own replies
+  (settled position error 0.006mm against ~0.87mm while moving). Extending a safety bound on a
+  dead-reckoned guess is a worse version of session 005's overshoot bug.
+
+### From the estimator on real bench data (session 008)
+
+- **Forecasting by the measured sensor lag removes 62% of the lag error.** Scored against
+  where the phantom actually is: 0.0888 mm RMSE for the forecast at `h = tau_s = 0.677 s`
+  against 0.2332 mm for reading the sensor and treating it as current. First end-to-end
+  evidence on hardware that a signal read 677 ms late can be put back into the present.
+- **The horizon is cheap; the lag is expensive.** Forecast RMSE rises from 0.0710 mm at
+  `h = 0` to 0.1016 mm at `h = 0.70 s` — +0.031 mm to buy back 0.144 mm. The curve is nearly
+  flat to ~0.4 s, so there is real headroom for `tau_c`, `tau_cl` and `T_ins` once measured.
+- **The 95% energy rule now has a price attached.** K=1 forecasts 49% worse than K=3
+  (0.0766 vs 0.0515 mm) on real bench data. Previous evidence was residual structure; this is
+  the cost in the units that matter. `configs/bench_aligned.yaml` uses `K_override: 3` and
+  keeps the 95% threshold configured but unused, so the report prints both.
+- **A measured `R` moved NIS from 0.040 to 0.243, not above 1.** So `S` is dominated by
+  `HPH'`, not by `R`: the filter's remaining inconsistency lives in **Q and the model, not the
+  noise floor**, and correcting `R` alone will not fix it. Use `identifier.params.R_override`
+  to supply a measured value; `R_source` always names which of the three paths was used.
+- **A smaller, more honest `R` slightly worsens the forecast** (0.0820 → 0.0989 mm) while
+  substantially improving covariance consistency. The gate needs the honest covariance more
+  than the last 0.017 mm of accuracy.
+- **`aligned.csv`'s `y_clean` column is what makes a bench forecast score meaningful.**
+  `CSVSource` reads that exact name into `SignalBatch.y_clean` and `ct.run.truth_function`
+  prefers it, so writing the phantom truth there scores the forecast against the *phantom*
+  rather than against the sensor. Without it the score is circular.
+
+### From the phantom-vs-sensor comparison (session 007)
+
+- **The tactile chain sees ~1/3 of the phantom's real excursion, 677 ms late — but
+  reproduces the waveform almost exactly once both are removed.** 2.64 mm of phantom motion
+  reads as 0.86 mm of deflection; correlation is 0.961 and the residual RMSE 0.072 mm after
+  taking out the lag and the scale. The lag *is* `latency.tau_s`; the attenuation sets the
+  amplitude the estimator actually works from. Neither was measured before.
+- **Any amplitude or agreement metric must be computed after removing the lag.** Projecting
+  the sensor onto an unshifted phantom folds delay into scale: at 677 ms against a ~4.9 s
+  breath that costs `cos(2*pi*0.677/4.93) ~ 0.63`, and `compare_logs` reported 0.203 where
+  the truth is 0.326. Fixed, and pinned by `test_amplitude_ratio_does_not_depend_on_the_lag`.
+  The independent check is Stage 1 on `aligned.csv`: `A_1` = 0.346 mm sensed, 1.063 mm true.
+- **Comparison metrics must be restricted to one procedure state.** Scored across a whole
+  bench run, correlation reads 0.039; over `standoff_hold` alone, 0.961. Approach and seat —
+  base moving, sensor unseated — do not dilute the answer, they replace it. Pass
+  `ct-compare --phase standoff_hold`.
+- **The estimator recovers the same fundamental from the sensor as from ground truth**
+  (12.172 vs 12.192 bpm) despite the attenuation and the delay. Frequency survives the
+  sensing chain where amplitude does not.
+- **677 ms is probably contact physics, not electronics** — most likely the viscoelastic
+  skin/lever settling session 005 measured at 1.39 mm over 5 s. If so `tau_s` varies with
+  seating depth rather than being a constant. Unresolved.
+
+### From the first real subject data (session 006)
+
+- **Real chest-wall breathing amplitude is ~0.5–1.4 mm RMS on a 4–8 mm peak-to-peak
+  excursion**, across seven subjects. That is an order of magnitude below the 10 mm amplitude
+  `configs/sinusoid.yaml` uses. It puts a measured number on the requirement that the tactile
+  sensor's usable stroke exceed the breathing excursion — though these are surface markers,
+  not the target organ, so the target's own amplitude is still unknown.
+- **The optical data is far cleaner than the synthetic configs assume**: uniform 120 Hz with no
+  jitter, at most 15 dropped frames in 73k, and a largest frame-to-frame step of 0.08–0.12 mm.
+  Effectively no high-frequency sensor noise at 120 Hz.
+- **The 95% energy rule selects `K=1` on all seven real subjects.** The RC-piecewise finding
+  above now has real-data backing; re-validate the threshold rather than carrying it over.
+- **The breathing rate is not stationary within a take, and for one subject it drifts enough to
+  break a fixed-`omega` Stage 1.** Derek's dominant peak measures 20.67 bpm over t ∈ [0,90),
+  14.67 over [90,180), 14.00 over [300,390); fitting the whole 90 s calibration window at one
+  `omega` recovers only `A_1 = 0.207 mm` of a 0.670 mm-std signal. This is the
+  `sinusoid_ramp.yaml` failure mode observed on real data. Emma and Moira are far more
+  stationary, so it is subject-dependent — a calibration-window stationarity guard is worth
+  considering.
 
 ## Open questions
 
@@ -257,22 +384,55 @@ than here — that list is machine-checked and generates
 capture.
 
 - Sensor modality and its real measured latency (optical ~10-30 ms vs ultrasound ~50-150 ms).
-  `ct-compare` measures it directly once both rigs run.
+  `ct-compare` measures it directly once both rigs run. The optical takes in
+  `unfiltered_data/` carry no synchronised second clock, so they do **not** settle `tau_s`.
+  **The tactile bench chain does, at 677 ms (session 007)** — far larger than either estimate
+  above, which is itself the reason to suspect it is contact settling rather than sensing.
+- ~~Whether the phantom motor broadcasts status densely enough while being commanded~~
+  **resolved (session 009): 51.1 Hz**, 2465 frames over 48.2s, a real measurement on
+  4209/4209 ticks. `measured_mm` is genuine ground truth, not a zero-order hold, and the
+  phantom tracks its own command to 99.1%. `ct-compare --truth measured_mm` can now separate
+  the phantom's own tracking lag from the sensing chain's — which no run has done yet, so
+  every latency number so far still uses `commanded_mm` and includes both.
+- **Whether the 677 ms lag and the 0.33 amplitude ratio are constants or move with seating
+  depth.** Session 005 measured the related compliance ratio at 0.22-0.68 across runs. If the
+  attenuation moves as much, the estimator sees a time-varying gain.
 - Target organ / expected motion amplitude
 - Clinical tolerance epsilon
 - Insertion depth / achievable needle velocity (sets `T_ins`)
 - Breath-hold viability as a fallback — note it would also give the preferred `R`.
   `procedure.approach.breath_hold_s` implements it; `rig_bench.yaml` has it on at 15 s.
-- Real sensor data: format, sample rate, availability timeline (teammates sourcing)
+- ~~Real sensor data: format, sample rate, availability timeline~~ **resolved (session 006)**:
+  OptiTrack CSV, 120 Hz, mm, nine chest-wall markers, seven subjects × 8–11 min, reduced into
+  `breathe_profiles/`. Latency is the part still open, above.
+- **Where `breathe_profiles/breathing_profile_1.csv` came from is unknown.** It is not derived
+  from any of the seven takes in `unfiltered_data/` (best correlation r = 0.005, against Jake,
+  despite a similar DC level). Trace it or retire it before anything depends on it.
 - Confirmation that the team's intended chest-wall model is Singh et al. 2020
-- **Which firmware the CubeMars motors are flashed with.** ADVANCE needs MIT-mode float on
-  the needle; the base wants servo mode for its travel. If they are the other way round,
-  that is a finding to act on rather than work around.
+- **Which firmware the CubeMars motors are flashed with — resolved for needle/base as of
+  session 004/005.** Both run the Gimbal Motor II Position/Velocity protocol (not MIT, not
+  servo), now confirmed against the real vendor manual rather than empirically inferred.
+  ADVANCE's need for MIT-mode float on the needle is therefore not available as-is — worth
+  revisiting when ADVANCE's actual compliance requirement is designed, per session 004's
+  still-open question of why MIT mode never produced clean motion on this motor.
 - **What interface/channel the RH02 enumerates as** (`python -m can.detect_available_configs`).
   Nothing can be tried on hardware until this is settled.
 - **`forecast_variance` is still uncalibrated against realised error.** It is what the
   firing gate thresholds on, so `max_forecast_std_mm` is a guess until it is checked.
-  Carried from session 001 and now load-bearing.
+  Carried from session 001 and now load-bearing. Session 008 measured the realised error
+  (0.0888 mm at `h = 0.677 s`), so this can finally be set against something real.
+- **Q, not R, is the leading suspect for the NIS shortfall** (session 008). NIS sits at 0.243
+  with a measured `R`. Q is estimated from breath-to-breath refits over only ~6 breaths in the
+  runs so far; the new 180 s `--record-s` default gives ~18, which is the first thing to try.
+- **In-contact `R` is unmeasured.** The 7.3e-6 mm² in `bench_aligned.yaml` is free-air with the
+  arm unloaded, and so a lower bound. A breath-hold during `standoff_hold` (pause the phantom,
+  set `identifier.params.breath_hold_window`) would measure it properly.
+- **Whether the corrected hold-position math actually eliminates the base motor's approach
+  overshoot is untested on hardware** as of session 005 — the fix is reasoned from one real
+  data point, not yet re-verified by a full run.
+- **GL-II Position/Velocity mode's torque/current range is undocumented** — the manual
+  gives position (±12.5 rad) and speed (±200 rad/s) but no current/torque scaling, so
+  `motor_current` in bench telemetry uses a placeholder and should not be trusted yet.
 
 ## Positioning for the paper
 

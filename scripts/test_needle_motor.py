@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
-"""Slow, small-travel sanity test for the needle motor (CubeMars GL40II, capstan drive).
+"""Slow, small-travel sanity test for the needle motor (CubeMars GL40II, position mode).
+
+Reverted to this protocol after an extended MIT-mode investigation (structural v_des fix,
+stale-controller-state fix, kp=0 testing) never produced clean motion -- some combination
+of gains and velocity targets either faulted the drive or was too weak to move it at all.
+Committing to position mode instead: mode-shifted addressing, float32 position+velocity
+payload. This isn't a new guess -- it's the one configuration with actual proof of working
+correctly on this exact motor (extended and retracted cleanly, direction confirmed) before
+any of the MIT-mode detour began, and it matches what scripts/test_base_motor.py already
+uses successfully. scripts/test_phantom_motor.py is on the equivalent real servo/position
+mode for its motor family. All three motors are now on their proven protocols.
 
 Moves only a few millimetres at low speed and back, so a wiring or direction mistake shows
-up as a small, easily-stopped motion instead of a full-speed 20 mm stroke. Run with
---dry-run first to see the exact frames this would send before anything moves.
+up as a small, easily-stopped motion instead of a full-speed stroke. Run with --dry-run
+first to see the exact frames this would send before anything moves.
 
 Protocol: CubeMars Gimbal Motor II Drive User Manual, section 5.2 (position/velocity CAN
 mode). CAN arbitration ID = (mode << 8) | node_id; a move command is `pos` (float32 rad) +
-`vel` (float32 rad/s), little-endian, 8 bytes packed as "<ff".
+`vel` (float32 rad/s), little-endian, 8 bytes packed as "<ff". Unlike MIT mode, `vel` here
+is a real firmware-enforced speed limit -- the motor's own trajectory controller handles
+smoothness and safety internally; this script doesn't need to (and shouldn't) simulate its
+own ramp on top of it.
 
 This commands a real motor. Nothing in this file runs on import -- you run it yourself:
 
@@ -24,7 +37,7 @@ import time
 import can
 
 # ---------------- Motor-specific config ----------------
-CAN_CHANNEL = "/dev/cu.usbmodem20563976534B1"  # confirm with `ls /dev/cu.*` -- may differ
+CAN_CHANNEL = "/dev/cu.usbmodem207635764E451"  # needle's current adapter -- confirm with `ls /dev/cu.*`
 CAN_INTERFACE = "slcan"
 BITRATE = 1_000_000  # GL-series driver board CAN bus speed
 

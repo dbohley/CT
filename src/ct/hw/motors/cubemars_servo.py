@@ -26,8 +26,14 @@ Extended 29-bit IDs, with the command in the upper byte::
     cmd 5  SET_ORIGIN        int8    0 temporary, 1 permanent, 2 restore default
     cmd 6  SET_POS_SPD       int32 degrees*10000, int16 speed/10, int16 accel/10
 
-Status frame 1 arrives on ``node_id | (9 << 8)``: position ``int16`` in 0.1°, speed
+Status frame 1 arrives on ``node_id | (41 << 8)``: position ``int16`` in 0.1°, speed
 ``int16`` in 10 ERPM, current ``int16`` in 0.01 A, then temperature and error bytes.
+**41 (0x29), not the stock VESC ``CAN_PACKET_STATUS`` value of 9** — confirmed by listening
+to a real, idle AK60-6 V3.0 with scripts/listen_phantom_motor.py: frames arrived unprompted
+on ``node_id | (0x29 << 8)`` with a payload that decodes cleanly into a plausible
+position/velocity/current/temperature/error tuple under this exact byte layout, while
+nothing ever arrived on ``(9 << 8)``. CubeMars apparently remapped the status packet id on
+this firmware; the payload layout itself matches stock VESC.
 
 Units
 -----
@@ -53,7 +59,8 @@ CMD_SET_RPM = 3
 CMD_SET_POS = 4
 CMD_SET_ORIGIN = 5
 CMD_SET_POS_SPD = 6
-CMD_STATUS_1 = 9
+CMD_STATUS_1 = 0x29  # 41 -- confirmed on real hardware; NOT stock VESC's CAN_PACKET_STATUS=9,
+# see the module docstring's "Status frame 1" note for how this was found.
 
 
 def _extended_id(node_id: int, command: int) -> int:

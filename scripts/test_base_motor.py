@@ -30,6 +30,7 @@ import can
 
 # ---------------- Motor-specific config ----------------
 CAN_CHANNEL = "/dev/cu.usbmodem20563976534B1"  # confirm with `ls /dev/cu.*` -- may differ
+CAN_CHANNEL = "/dev/cu.usbmodem207635764E451"
 CAN_INTERFACE = "slcan"
 BITRATE = 1_000_000  # GL-series driver board CAN bus speed
 

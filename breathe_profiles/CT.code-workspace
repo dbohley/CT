@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"name": "CT_sensors",
+			"path": "../../../Documents/PlatformIO/Projects/CT_sensors"
+		}
+	],
+	"settings": {}
+}

@@ -21,7 +21,12 @@ bit-packed::
     12      kd       [0, kd_max]
     12      t_ff     [t_min, t_max]   N·m
 
-Reply — ID 0, 6 bytes: ``[node_id, p(16), v(12), i(12)]``.
+Reply — ID 0, 6 bytes: ``[id|err<<4, p(16), v(12), i(12)]``. The first byte is *not* a
+bare node id — the low nibble is the node id (0-15) and the high nibble is a fault code
+(see :data:`MIT_FAULT_CODES`). Reading the whole byte as the node id, as an earlier
+version of this module did, turns a fault report into a nonsense id instead of surfacing
+it — a real bug found the hard way on the bench: a motor reporting undervoltage on node 2
+decoded as node "146" until this was fixed.
 
 Special frames, all ``FF FF FF FF FF FF FF xx``: ``FC`` enter motor mode, ``FD`` exit,
 ``FE`` set the present position as zero.
@@ -52,6 +57,18 @@ ENTER_MOTOR_MODE = bytes([0xFF] * 7 + [0xFC])
 EXIT_MOTOR_MODE = bytes([0xFF] * 7 + [0xFD])
 #: Declare the present position to be zero.
 SET_ZERO_POSITION = bytes([0xFF] * 7 + [0xFE])
+
+#: Fault codes packed into the high nibble of a reply's first byte. 0 (absent here) means
+#: no fault. Values from the vendor's CAN protocol table.
+MIT_FAULT_CODES = {
+    0x8: "overvoltage",
+    0x9: "undervoltage",
+    0xA: "overcurrent",
+    0xB: "MOS overtemperature",
+    0xC: "motor coil overtemperature",
+    0xD: "communication lost",
+    0xE: "overload",
+}
 
 
 def float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
@@ -167,15 +184,21 @@ class CubeMarsMIT:
         byte, so the ID alone does not identify the sender — the caller has to match on
         ``node_id`` from the returned dict. Returns ``None`` for anything that is not a
         well-formed reply, so several codecs can share a bus.
+
+        That first byte packs the node id into its low nibble and a fault code into its
+        high nibble (0 = no fault; see :data:`MIT_FAULT_CODES` for the rest) — both are
+        split out here rather than left for the caller to unpack.
         """
         if can_id != 0 or len(data) < 6:
             return None
-        node_id = data[0]
+        node_id = data[0] & 0x0F
+        error = (data[0] >> 4) & 0x0F
         p_int = (data[1] << 8) | data[2]
         v_int = (data[3] << 4) | (data[4] >> 4)
         i_int = ((data[4] & 0x0F) << 8) | data[5]
         return {
             "node_id": float(node_id),
+            "error": float(error),
             "position": uint_to_float(p_int, self.p_min, self.p_max, 16),
             "velocity": uint_to_float(v_int, self.v_min, self.v_max, 12),
             "current": uint_to_float(i_int, self.t_min, self.t_max, 12),
@@ -211,20 +234,25 @@ class CubeMarsMIT:
         }
 
     def encode_reply(
-        self, node_id: int, position: float, velocity: float, current: float
+        self, node_id: int, position: float, velocity: float, current: float, error: int = 0
     ) -> tuple[int, bytes, bool]:
         """Build a reply frame. Used by the simulated motors to answer realistically.
 
         Living next to :meth:`parse` rather than in the plant is deliberate: encode and
         decode of one wire format belong together, and a round-trip test over this pair
         is what proves the packing is right.
+
+        ``node_id`` must fit in 4 bits (0-15) — that's all the wire format allocates for
+        it in a reply frame; ``error`` likewise, see :data:`MIT_FAULT_CODES`. Both are
+        masked rather than raised on, consistent with how out-of-range values are handled
+        elsewhere in this codec.
         """
         p_int = float_to_uint(position, self.p_min, self.p_max, 16)
         v_int = float_to_uint(velocity, self.v_min, self.v_max, 12)
         i_int = float_to_uint(current, self.t_min, self.t_max, 12)
         data = bytes(
             (
-                node_id & 0xFF,
+                ((error & 0x0F) << 4) | (node_id & 0x0F),
                 (p_int >> 8) & 0xFF,
                 p_int & 0xFF,
                 (v_int >> 4) & 0xFF,

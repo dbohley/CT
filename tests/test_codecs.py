@@ -17,6 +17,7 @@ import pytest
 from ct.hw.motors.cubemars_mit import (
     ENTER_MOTOR_MODE,
     EXIT_MOTOR_MODE,
+    MIT_FAULT_CODES,
     SET_ZERO_POSITION,
     CubeMarsMIT,
     float_to_uint,
@@ -85,8 +86,20 @@ def test_mit_reply_round_trips(mit):
     assert can_id == 0, "MIT replies all arrive on ID 0 with the node id in the payload"
     parsed = mit.parse(can_id, data)
     assert int(parsed["node_id"]) == 7
+    assert parsed["error"] == 0
     assert parsed["position"] == pytest.approx(-3.25, abs=1e-3)
     assert parsed["velocity"] == pytest.approx(1.5, abs=0.05)
+
+
+def test_mit_reply_splits_fault_code_from_node_id(mit):
+    """Found on the bench: a node-2 reply reporting undervoltage decoded as node "146"
+    until this split existed, because the first byte packs id and fault into one byte
+    (id | err << 4) rather than being a bare node id."""
+    can_id, data, _ = mit.encode_reply(2, position=0.0, velocity=0.0, current=0.0, error=0x9)
+    parsed = mit.parse(can_id, data)
+    assert int(parsed["node_id"]) == 2
+    assert int(parsed["error"]) == 0x9
+    assert MIT_FAULT_CODES[int(parsed["error"])] == "undervoltage"
 
 
 def test_mit_float_is_expressible(mit):

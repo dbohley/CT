@@ -1,0 +1,75 @@
+# Run the estimator on a bench run's aligned.csv -- real sensor data from real hardware,
+# rather than a synthetic trace.
+#
+# scripts/plot_approach_and_seat.py writes <run>/aligned.csv with columns
+# time_s,sensor_mm,truth_mm over the standoff_hold window: what the tactile sensor read,
+# and what the phantom was actually doing at the same instant. Point source.params.path at
+# one and the whole Stage-1/Stage-2 pipeline runs on it:
+#
+#   ct-identify --config bench_aligned \
+#     --set source.params.path=outputs/approach_and_seat/<ts>/aligned.csv
+#
+# Swap y_column to truth_mm to identify the phantom's own motion instead -- the upper bound
+# on what any estimator could recover from this sensor, and the thing to score against.
+#
+# A separate config rather than `--config sinusoid --set source.name=csv` because that
+# config's source.params carry sinusoid-only keys (breaths_per_min, amplitudes, ...) and
+# --set can add keys but not remove them, so CSVSource rejects the lot.
+#
+# fs is left unset: CSVSource infers it from the timestamps, which is right here because the
+# grid comes from the controller's own measured sample rate (~127Hz on the bench, not a
+# round number) rather than from anything configured.
+name: bench_aligned
+duration: 300.0
+fs: 127.0
+# Q is estimated from breath-to-breath refits, so the calibration window is really measured
+# in breaths, not seconds: 90s is ~18 breaths at 12bpm, matching what session 006 had on the
+# OptiTrack recordings. That needs run_approach_and_seat.py --record-s 180 (its new default);
+# a 60s hold only affords ~6 refits and Q comes out noisy.
+calib_seconds: 90.0
+# The MEASURED sensor lag (session 007, cross-correlation of tactile against the phantom's
+# real position). Forecasting by exactly this should put the estimate back on top of where
+# the phantom is *now*, cancelling the delay -- which is the one claim this whole pipeline
+# exists to support, and the reason this is not a round number.
+horizon: 0.677
+seed: 0
+
+source:
+  name: csv
+  params:
+    path: outputs/approach_and_seat/latest/aligned.csv
+    t_column: time_s
+    y_column: sensor_mm
+
+identifier:
+  name: fft_harmonic
+  params:
+    Kmax: 8
+    # The 95% rule is kept, and deliberately not used, so the report prints what it *would*
+    # have picked next to what is used. On this data it says K=1; measured forecast RMSE at
+    # h=0.677s is 0.0766mm at K=1, 0.0515mm at K=3, 0.0484mm at K=4. K=3 takes essentially
+    # all of the gain -- K=4 buys another 6% for two more states to estimate, each drifting
+    # under Q. The disagreement between rule and choice is a finding, not something to hide.
+    energy_threshold: 0.95
+    K_override: 3
+    # Directly measured sensor noise: session 005 recorded the tactile arm stationary and
+    # got std 0.0027mm, so R = 0.0027^2. This replaces Stage 1's residual-variance fallback
+    # (0.00943mm^2 here), which is an upper bound containing model mismatch and drove NIS to
+    # 0.090 against an expected 1.0.
+    #
+    # It is honestly a LOWER bound: that measurement was free-air with the arm unloaded, and
+    # measure_sensor_noise.py's own docstring flags that pressing the arm into skin adds
+    # off-axis wobble it cannot see. Measured effect on run 20260901-165415: NIS 0.090 ->
+    # 0.245. Still under the expected 1.0, so R is *still* too large even at the free-air
+    # value -- S is dominated by P, not by R, which says the remaining inconsistency is in Q
+    # and the model rather than in the noise floor. Settling it properly needs a breath-hold
+    # segment measured in contact (pause the phantom mid-hold, set breath_hold_window),
+    # which would make this one line obsolete.
+    R_override: 7.3e-6
+    p0_inflation: 2.0
+
+tracker:
+  name: harmonic_ekf
+  params:
+    joseph: true
+    wrap_phases: true

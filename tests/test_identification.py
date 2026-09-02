@@ -222,6 +222,31 @@ def test_R_prefers_a_breath_hold_segment_over_the_residual():
     assert without.R > with_hold.R
 
 
+@pytest.mark.filterwarnings("ignore:FFT and autocorrelation:UserWarning")
+def test_R_override_beats_every_other_path_and_says_where_R_came_from():
+    """A directly measured R outranks both a breath hold and the residual fallback.
+
+    It is the only one of the three that measures the *sensor* rather than a fit, and it is
+    how a bench number (scripts/measure_sensor_noise.py) replaces a placeholder. R_source
+    must name it, so a report can never quietly present a configured R as a measured one.
+    """
+    from ct.identification.fft_identifier import FFTHarmonicIdentifier
+
+    src = build_source("rc_piecewise", {"fs": 50.0, "noise_std": 0.2, "seed": 6})
+    batch = src.batch(180.0)
+
+    forced = FFTHarmonicIdentifier(R_override=7.3e-6).identify(batch)
+    assert forced.R == pytest.approx(7.3e-6)
+    assert forced.diagnostics["R_source"] == "configured (R_override)"
+
+    # Even with a breath-hold window offered, the configured value wins.
+    both = FFTHarmonicIdentifier(R_override=7.3e-6, breath_hold_window=(100.0, 110.0)).identify(batch)
+    assert both.R == pytest.approx(7.3e-6)
+    assert both.diagnostics["R_source"] == "configured (R_override)"
+
+    assert FFTHarmonicIdentifier().identify(batch).R > forced.R
+
+
 def test_K_override_bypasses_the_energy_rule():
     from ct.identification.fft_identifier import FFTHarmonicIdentifier
 

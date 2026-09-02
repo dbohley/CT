@@ -6,7 +6,8 @@ Assembles the pieces into the one thing Stage 2 needs — ``(K, s0, P0, Q, R)``:
     2. OLS harmonic regression at that fixed frequency, up to ``Kmax``
     3. convert to amplitudes/phases, pick ``K`` by the 95% energy rule
     4. refit at the chosen ``K`` so ``P0`` reflects the model actually tracked
-    5. ``R`` from a breath-hold segment if available, residual variance otherwise
+    5. ``R`` from a configured measurement if given, a breath-hold segment if
+       available, residual variance otherwise (an upper bound -- see ``_estimate_R``)
     6. ``Q`` from breath-to-breath refits
 """
 
@@ -48,6 +49,7 @@ class FFTHarmonicIdentifier:
         q_floor: float = 1e-12,
         r_floor: float = 1e-9,
         breath_hold_window: tuple[float, float] | None = None,
+        R_override: float | None = None,
     ) -> None:
         self.Kmax = int(Kmax)
         self.energy_threshold = float(energy_threshold)
@@ -61,6 +63,12 @@ class FFTHarmonicIdentifier:
         self.q_floor = float(q_floor)
         self.r_floor = float(r_floor)
         self.breath_hold_window = breath_hold_window
+        # A directly measured R, e.g. from scripts/measure_sensor_noise.py. Beats both
+        # other paths because it is the only one that is a measurement of the *sensor*
+        # rather than of a fit: breath_hold_window still needs a still segment inside the
+        # calibration window to exist, and the residual variance is an upper bound
+        # containing every part of the waveform the truncated model failed to represent.
+        self.R_override = None if R_override is None else float(R_override)
 
     def identify(self, batch: SignalBatch) -> IdentificationResult:
         t, y = batch.t, batch.y
@@ -165,6 +173,9 @@ class FFTHarmonicIdentifier:
         return P0
 
     def _estimate_R(self, batch: SignalBatch, fit) -> float:
+        if self.R_override is not None:
+            self._R_source = "configured (R_override)"
+            return max(self.R_override, self.r_floor)
         if self.breath_hold_window is not None:
             lo, hi = self.breath_hold_window
             seg = batch.y[(batch.t >= lo) & (batch.t < hi)]
@@ -183,6 +194,7 @@ class FFTHarmonicIdentifier:
             "Kmax": self.Kmax,
             "energy_threshold": self.energy_threshold,
             "K_override": self.K_override,
+            "R_override": self.R_override,
             "p0_inflation": self.p0_inflation,
             "q_scale": self.q_scale,
         }
