@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from ct.control.gate import FiringGate, cycle_extrema
-from ct.control.live import AmplitudeWatcher, SignalAccumulator
+from ct.control.live import AmplitudeWatcher, BreathPeakWatcher, SignalAccumulator
 from ct.control.safety import SafetyMonitor
 from ct.control.servo import LeadServo, bandwidth, residual_lag
 from ct.control.state import ProcedureState, next_in_sequence
@@ -318,6 +318,112 @@ def test_amplitude_watcher_reports_peak_to_trough_over_its_window():
     assert watcher.full
     assert watcher.amplitude == pytest.approx(2.0, abs=0.1)
     assert watcher.span <= 1.0 + 1e-9
+
+
+# -- breathing peaks, for standoff --------------------------------------------
+
+
+def _breathing(peaks, period=5.5, fs=100.0, baseline=0.0, drift=0.0):
+    """A breathing trace whose successive breaths reach exactly the given peaks."""
+    t, y = [], []
+    clock = 0.0
+    for i, peak in enumerate(peaks):
+        n = int(period * fs)
+        for k in range(n):
+            phase = 2 * np.pi * k / n
+            t.append(clock)
+            y.append(baseline + drift * clock + peak * 0.5 * (1 - np.cos(phase)))
+            clock += 1 / fs
+        del i
+    return np.array(t), np.array(y)
+
+
+def test_breath_peak_watcher_counts_whole_breaths_not_seconds():
+    """The window used to be min_breaths * nominal_breath_s, and nothing kept the nominal
+    honest: 2 x 4.0s = 8.0s against a real 5.51s period is 1.45 breaths, not 2."""
+    t, y = _breathing([1.0] * 6, period=5.5)
+    watcher = BreathPeakWatcher(n_breaths=2)
+
+    ready_at = None
+    for ti, yi in zip(t, y):
+        watcher.add(ti, yi)
+        if ready_at is None and watcher.ready:
+            ready_at = ti
+
+    assert watcher.breaths >= 2
+    # Two whole breaths of a 5.5s cycle cannot be judged in the 8.0s the old window allowed.
+    assert ready_at > 8.0
+    assert watcher.period_s == pytest.approx(5.5, rel=0.05)
+
+
+def test_breath_peak_is_unbiased_where_max_over_a_window_is_not():
+    """The defect that drove the spurious retreats of run 20260903-152958.
+
+    Real breathing varies breath to breath, so the MAXIMUM over a window sits above the
+    typical peak by an amount that grows with the window -- and standoff retreats whenever
+    its reading exceeds target, so that bias alone moves the base the wrong way. Replayed
+    over the stationary measurement segments of the two runs on 2026-09-03, max-over-8s read
+    +0.48 and +0.54mm higher than the mean of two real breaths.
+    """
+    peaks = [8.0, 9.0, 8.0, 9.0, 8.0, 9.0]      # typical peak is 8.5
+    t, y = _breathing(peaks, period=5.0)
+
+    breath = BreathPeakWatcher(n_breaths=2)
+    window = AmplitudeWatcher(window_s=2 * 5.0)
+    for ti, yi in zip(t, y):
+        breath.add(ti, yi)
+        window.add(ti, yi)
+
+    assert breath.peak == pytest.approx(8.5, abs=0.05)   # unbiased
+    assert window.peak == pytest.approx(9.0, abs=0.05)   # biased to the deepest breath
+    assert window.peak - breath.peak > 0.4
+    assert breath.peak_spread == pytest.approx(1.0, abs=0.05)
+
+
+def test_breath_segmentation_survives_a_wandering_baseline():
+    """Real subject profiles carry slow baseline wander (session 009), which a fixed crossing
+    level would eventually sit outside entirely.
+
+    ``emma_normal_breathing`` drifts -0.00513 mm/s over a 180s run, 0.92mm against a ~4.6mm
+    excursion. 0.01 mm/s here is twice that rate at half the amplitude, so the drift-to-signal
+    ratio is about four times what the bench actually sees.
+    """
+    t, y = _breathing([2.0] * 8, period=5.0, baseline=5.0, drift=0.01)
+    watcher = BreathPeakWatcher(n_breaths=2)
+    for ti, yi in zip(t, y):
+        watcher.add(ti, yi)
+
+    # Only completed breaths count, so the partial one at each end is not expected.
+    assert watcher.breaths >= 6
+    assert watcher.period_s == pytest.approx(5.0, rel=0.05)
+    assert watcher.peak == pytest.approx(2.0 + 5.0, abs=0.5)
+
+
+def test_breath_peak_watcher_ignores_a_partial_breath():
+    """A half-finished breath must never be banked as a shallow one -- that would read as a
+    peak below target and buy a step the base did not need."""
+    t, y = _breathing([4.0, 4.0], period=5.0)
+    cut = int(len(t) * 0.75)             # stop mid-way through the second breath
+    watcher = BreathPeakWatcher(n_breaths=2)
+    for ti, yi in zip(t[:cut], y[:cut]):
+        watcher.add(ti, yi)
+
+    assert watcher.breaths == 1
+    assert not watcher.ready
+    assert watcher.peak == pytest.approx(4.0, abs=0.05)
+
+
+def test_resetting_forgets_samples_from_before_a_base_move():
+    t, y = _breathing([3.0] * 4, period=5.0)
+    watcher = BreathPeakWatcher(n_breaths=2)
+    for ti, yi in zip(t, y):
+        watcher.add(ti, yi)
+    assert watcher.ready
+
+    watcher.reset()
+    assert watcher.breaths == 0
+    assert not watcher.ready
+    assert watcher.period_s is None
 
 
 # -- state machine ------------------------------------------------------------

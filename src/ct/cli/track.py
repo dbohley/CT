@@ -14,7 +14,7 @@ from ct.cli._common import add_common_args, header, print_kv, resolve_config, sa
 from ct.diagnostics import metrics
 from ct.layout import StateLayout
 from ct.registry import build_identifier, build_tracker
-from ct.run import build_source_from_config, track, truth_function
+from ct.run import build_source_from_config, resolve_tracker_params, track, truth_function
 from ct.types import IdentificationResult
 
 
@@ -52,7 +52,8 @@ def main(argv: list[str] | None = None) -> int:
     if tracking.N < 10:
         raise SystemExit(f"only {tracking.N} samples to track; extend --duration")
 
-    tracker = build_tracker(cfg.tracker["name"], cfg.tracker.get("params"))
+    tracker_params = resolve_tracker_params(cfg.tracker.get("params"), ident.diagnostics["bpm_hat"])
+    tracker = build_tracker(cfg.tracker["name"], tracker_params)
     history = track(
         tracker, tracking, ident, horizon=cfg.horizon, truth_at=truth_function(source, batch)
     )

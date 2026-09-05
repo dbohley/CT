@@ -471,8 +471,18 @@ UNKNOWNS: tuple[Unknown, ...] = (
         why="First term of the forecast horizon h. Under-estimate it and every forecast is "
             "systematically early.",
         how_to_measure="Already automated: run `ct-phantom` and `ct-rig` together and use "
-                       "`ct-compare`, which reports the cross-correlation lag between commanded "
-                       "phantom motion and sensed motion. That lag is this number.",
+                       "`ct-compare`, which reports the cross-correlation lag between phantom "
+                       "motion and sensed motion. Use `--sensor tof_mm`: the ToF is non-contact "
+                       "but shares the bus and the tick loop, so its lag is the sensing chain "
+                       "alone. Measured at 0.011-0.098 s over seven bench runs, consistent with "
+                       "the ~8 ms frame period plus the ~11 ms tick, and an upper bound because "
+                       "the ToF quantises to 1 mm. The default `--sensor tactile_mm` reads "
+                       "0.282-0.696 s instead -- that is NOT this number: the difference is "
+                       "viscoelastic settling in the contact, it is mechanical rather than "
+                       "electronic, and it moves with seating depth (+0.63 correlation) rather "
+                       "than being a constant. The forecast still has to cover the whole tactile "
+                       "figure while the arm is the sensor, which is why "
+                       "plot_approach_and_seat.py measures it per run instead of configuring it.",
         owner="controls",
         placeholder=0.02,
         blocks=(ProcedureState.INSERT, ProcedureState.ADVANCE),

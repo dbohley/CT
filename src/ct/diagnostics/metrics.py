@@ -95,6 +95,23 @@ def summarize(
     }
 
 
+def is_frequency_locked(
+    tracked_mean: float, tracked_std: float, ident_bpm: float, tolerance: float = 0.15
+) -> bool:
+    """Did the tracker hold the frequency Stage 1 handed it, within ``tolerance``?
+
+    Both the tracked mean's distance from Stage 1's rate and the tracked std must be under
+    ``tolerance * ident_bpm`` — a tight mean with a wide std is still not locked, since
+    ``phi_1`` can wander far enough between samples to fake a low mean. Shared by the bench
+    report (``scripts/plot_approach_and_seat.py``) and any offline sweep that needs the exact
+    same definition of "locked", so the threshold can't drift between the two.
+    """
+    return (
+        abs(tracked_mean - ident_bpm) < tolerance * ident_bpm
+        and tracked_std < tolerance * ident_bpm
+    )
+
+
 def forecast_errors(
     predicted: np.ndarray, actual: np.ndarray, warmup: int = 0
 ) -> dict[str, float]:

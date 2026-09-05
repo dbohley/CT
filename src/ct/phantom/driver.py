@@ -235,6 +235,41 @@ def count_seams(y: np.ndarray) -> int:
     return int(np.count_nonzero(steps > SEAM_JUMP_FACTOR * reference))
 
 
+SENSOR_SIGN = {"tactile_mm": 1.0, "tactile_raw_mm": 1.0, "tof_mm": -1.0}
+"""Which way each controller column moves when the phantom surface advances.
+
+Tactile deflection *grows* as the surface pushes the arm back; ToF *distance* shrinks.
+This is fixed physics per sensor, not something to discover per run — and discovering it
+is not even possible from one run, because for a near-sinusoidal signal an inverted sensor
+is indistinguishable from a correctly-signed one half a breath away. Orienting both to the
+phantom up front also makes their amplitude ratios directly comparable: on the bench the
+ToF reads 0.79-1.10 of real excursion against the tactile arm's 0.16-0.76.
+"""
+
+
+def _refine_peak(corr: np.ndarray, idx: int) -> float:
+    """Sub-sample offset of a correlation peak, in samples.
+
+    The raw ``argmax`` quantises the lag to one grid sample — 7.9 ms at the bench's
+    127 Hz. That was tolerable while the lag was a curiosity; it is not now that the
+    number sets the forecast horizon.
+    """
+    from ct.identification.spectral import _parabolic_offset_linear  # noqa: PLC0415
+
+    return _parabolic_offset_linear(corr, idx)
+
+
+def _breath_period_s(grid: np.ndarray, gp: np.ndarray) -> float | None:
+    """Dominant breathing period of the phantom series, or ``None`` if unmeasurable."""
+    from ct.identification.spectral import fft_peak_omega  # noqa: PLC0415
+
+    try:
+        omega, _ = fft_peak_omega(grid, gp)
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    return float(2.0 * np.pi / omega) if omega > 0 else None
+
+
 def compare_logs(
     phantom_path: str | Path,
     controller_path: str | Path,
@@ -242,6 +277,8 @@ def compare_logs(
     max_lag_s: float = 1.0,
     phase: str | None = None,
     phantom_field: str = "commanded_mm",
+    sensor_field: str = "tactile_mm",
+    sensor_sign: float | None = None,
 ) -> dict[str, Any]:
     """Align a phantom log against a controller log and score the sensing.
 
@@ -268,6 +305,18 @@ def compare_logs(
     ``"auto"`` for measured-with-fallback. Comparing the two isolates the phantom's own
     tracking error from the sensing chain's.
 
+    ``sensor_field`` chooses which controller column is the sensor. The default
+    ``tactile_mm`` is the contact chain the estimator actually consumes; passing
+    ``tof_mm`` measures the *non-contact* path over the same bus, the same tick loop and
+    the same motion, which is what separates sensing latency from contact settling. On the
+    bench that split is stark: the ToF lags under ~0.1 s where the tactile arm lags
+    0.28-0.56 s, so all but a few tens of milliseconds of the historical 0.677 s "tau_s"
+    is viscoelastic settling in the contact, not latency in the sensor.
+
+    ``sensor_sign`` orients that column to the phantom; it defaults from
+    :data:`SENSOR_SIGN` and rarely needs passing. All metrics are reported in the oriented
+    frame, so ``amplitude_ratio`` is positive for a working sensor of either polarity.
+
     Sign convention: the controller senses tactile *deflection*, which increases as the
     phantom surface advances toward the rig, so the two series are compared after removing
     each one's mean. Only the shape and timing are meaningful; the offsets are two
@@ -275,8 +324,17 @@ def compare_logs(
     """
     from ct.rt.telemetry import load_jsonl  # noqa: PLC0415
 
+    sign = float(SENSOR_SIGN.get(sensor_field, 1.0) if sensor_sign is None else sensor_sign)
+
     phantom = load_jsonl(phantom_path)
-    controller = [r for r in load_jsonl(controller_path) if r.get("tactile_mm") is not None]
+    all_controller = load_jsonl(controller_path)
+    controller = [r for r in all_controller if r.get(sensor_field) is not None]
+    if not controller:
+        available = sorted({k for r in all_controller for k, v in r.items() if v is not None})
+        raise ValueError(
+            f"controller log has no usable '{sensor_field}' column "
+            f"(fields present: {available})."
+        )
     if phase is not None:
         controller = [r for r in controller if r.get("phase") == phase]
     if len(phantom) < 10 or len(controller) < 10:
@@ -291,7 +349,7 @@ def compare_logs(
     # are counted on the raw series, before any interpolation. See count_seams.
     t_commanded, commanded, _ = _phantom_series(phantom, "commanded_mm")
     tc = np.array([r["t"] for r in controller], dtype=float)
-    yc = np.array([r["tactile_mm"] for r in controller], dtype=float)
+    yc = np.array([r[sensor_field] for r in controller], dtype=float)
 
     t_start, t_end = max(tp[0], tc[0]), min(tp[-1], tc[-1])
     if t_end - t_start < 1.0:
@@ -303,16 +361,44 @@ def compare_logs(
     fs = 1.0 / float(np.median(np.diff(tc)))
     grid = np.arange(t_start, t_end, 1.0 / fs)
     gp = np.interp(grid, tp, yp)
-    gc = np.interp(grid, tc, yc)
+    gc = np.interp(grid, tc, yc) * sign
     gp -= gp.mean()
     gc -= gc.mean()
 
-    max_shift = int(max_lag_s * fs)
-    correlation = np.correlate(gc, gp, mode="full")
-    lags = np.arange(-len(gp) + 1, len(gp))
-    keep = np.abs(lags) <= max_shift
-    best = lags[keep][int(np.argmax(correlation[keep]))]
-    lag_s = float(best / fs)
+    # Breathing is periodic, so the correlation surface is periodic in the lag: there is a
+    # sidelobe at every lag +/- T_breath, and nothing in an argmax prefers the true one.
+    # Search wider than half a period and the answer can alias to a neighbouring cycle --
+    # not a hypothetical, a +/-3s scan of the ToF against this bench's ~5.8s breathing
+    # returned -2.77s. Clamp the search to just inside T/2 and say so when the caller's
+    # max_lag_s was the thing that had to give.
+    breath_period_s = _breath_period_s(grid, gp)
+    requested_shift = int(max_lag_s * fs)
+    ambiguity_shift = (
+        int(0.45 * breath_period_s * fs) if breath_period_s is not None else requested_shift
+    )
+    max_shift = max(1, min(requested_shift, ambiguity_shift))
+
+    # Normalise each shift by the energy of the two segments that actually overlap at it.
+    # Raw np.correlate is a bare dot product over n-|k| terms, so the shrinking overlap
+    # imposes a triangular taper pulling the peak toward zero lag; dividing by the overlap
+    # count alone over-corrects and pushes it the other way (on a synthetic 0.235s lag that
+    # lands 0.9 samples high, worse than not interpolating). Dividing by sqrt(Ec*Ep) is the
+    # per-shift correlation coefficient and is unbiased in the lag.
+    n = len(gp)
+    lags = np.arange(-max_shift, max_shift + 1)
+    cp = np.concatenate([[0.0], np.cumsum(gp**2)])
+    cc = np.concatenate([[0.0], np.cumsum(gc**2)])
+    kept = np.empty(lags.size)
+    for i, k in enumerate(lags):
+        # k > 0: sensor lags, so gc[k:] lines up with gp[:n-k].
+        pa, pb = (0, n - k) if k >= 0 else (-k, n)
+        ca, cb = (k, n) if k >= 0 else (0, n + k)
+        energy = (cp[pb] - cp[pa]) * (cc[cb] - cc[ca])
+        kept[i] = np.dot(gc[ca:cb], gp[pa:pb]) / np.sqrt(energy) if energy > 0 else 0.0
+
+    peak = int(np.argmax(kept))
+    best = int(lags[peak])
+    lag_s = float((best + _refine_peak(kept, peak)) / fs)
 
     # Every amplitude/agreement number must be computed AFTER taking the lag out. On the
     # unshifted series a 0.677s lag against a ~4.9s breath projects the phantom onto the
@@ -330,6 +416,9 @@ def compare_logs(
         "samples": int(grid.size),
         "phase": phase,
         "phantom_field_used": field_used,
+        "sensor_field_used": sensor_field,
+        "sensor_sign": sign,
+        "breath_period_s": breath_period_s,
         # Residual of the sensor against the lag-aligned, amplitude-matched phantom: what an
         # estimator would still have to contend with once the two characterised effects
         # (delay and attenuation) are taken out. This is the number the EKF has to beat.
@@ -337,10 +426,21 @@ def compare_logs(
         "bias_mm": float(np.mean(residual)),
         "amplitude_ratio": scale,
         "lag_s": lag_s,
-        "lag_note": "cross-correlation peak; this is a direct measurement of latency.tau_s",
+        "lag_note": (
+            "normalized cross-correlation peak, refined to sub-sample by parabolic fit. "
+            "For sensor_field='tactile_mm' this is the WHOLE sensing lag, most of which is "
+            "viscoelastic settling in the contact rather than latency in the sensor -- "
+            "compare against sensor_field='tof_mm' to split them."
+        ),
         # A peak up against the edge of the search range is not a measurement, it is the
-        # range running out. The real bench lag is 0.677s against a 1.0s default.
+        # range running out.
         "lag_at_search_edge": bool(max_shift > 0 and abs(best) >= 0.8 * max_shift),
+        # ...and a search range wider than half a breath cannot distinguish a lag from the
+        # same lag one cycle over, however confident the peak looks.
+        "lag_ambiguous": bool(
+            breath_period_s is not None and requested_shift > ambiguity_shift
+        ),
+        "max_lag_searched_s": float(max_shift / fs),
         "correlation": float(np.corrcoef(ac, ap)[0, 1]),
         "correlation_unshifted": float(np.corrcoef(gc, gp)[0, 1]),
         "metric_note": (

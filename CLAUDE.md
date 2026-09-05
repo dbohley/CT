@@ -356,6 +356,44 @@ not really produced is worse than no session doc.
   (settled position error 0.006mm against ~0.87mm while moving). Extending a safety bound on a
   dead-reckoned guess is a worse version of session 005's overshoot bug.
 
+### From the standoff convergence failure (session 014)
+
+- **`max` over a window is a biased estimator of a noisy periodic peak, and the bias grows
+  with the window.** Standoff measured the breathing peak that way and retreats whenever the
+  reading exceeds target, so the bias moved the base backwards from positions that were
+  actually short. Replayed over both 2026-09-03 runs' stationary measurement segments it read
+  **+0.48 and +0.54 mm high, worst case +1.77 mm**, against a 0.30 mm tolerance. The perverse
+  part: waiting longer to "measure more carefully" increases the bias. Use the **mean over a
+  counted number of whole cycles** (`BreathPeakWatcher` in `control/live.py`) — unbiased, with
+  a standard error that falls the way an average should.
+- **A tolerance below the signal's own variability cannot be met reliably at any seating.**
+  Accepting became luck: one run settled in 3 fine steps, the next took 13 with 6 retreats and
+  had to be cancelled. `summary.json` now records `breath_spread_mm` so the floor is visible
+  next to the tolerance — if runs still take many steps, widen the band rather than lengthen
+  the measurement.
+- **An acceptance band around a target should be two-sided.** One-sided
+  `[target−tol, target]` turned every over-read into a base move.
+- **A "nominal" constant that nothing checks drifts away from the truth.**
+  `nominal_breath_s = 4.0` against a real 5.51 s made `min_breaths × nominal_breath_s` 1.45
+  breaths, not 2. Count the real thing and report the measured period beside the nominal.
+- **The tare's premise has to be enforced, not assumed.** It assumes the sensor starts out of
+  contact — true in a real procedure, but not of a run started right after one that left the
+  base pressed in, since nothing moves the base at exit. That run tared a *moving* arm
+  (p2p 8.330 mm vs 0.014 mm free), giving a 0.352 mm zero against a 0.140 mm true rest:
+  contact at t = 0.006 s, **no APPROACH phase at all**, seat accepted at 0.219 mm. A loaded
+  tare now refuses instead of warning; the base is backed off by hand between runs, not by
+  the script.
+- **A closed loop needs a give-up condition or its failures are undiagnosable.** A cancelled
+  run reports nothing about why it was cancelled. Same lesson as session 009's approach-travel
+  fault, in a different loop.
+- **Do not add autonomous physical motion as an unrequested fix, even a bounded one.** An
+  automatic base-retraction step was drafted for the tare problem above, passed every offline
+  check, and was removed on sight at the user's direction — it moved the rig on its own after
+  every run, which nobody asked for and which had never touched hardware. A plan approving a
+  described behaviour is not authorization to autonomously widen that behaviour's scope on a
+  physical system with a needle axis nearby. Default to refusing and naming the problem; leave
+  the physical correction to the operator unless explicitly asked to automate it.
+
 ### From the estimator on real bench data (session 008)
 
 - **Forecasting by the measured sensor lag removes 62% of the lag error.** Scored against
@@ -402,7 +440,161 @@ not really produced is worse than no session doc.
   sensing chain where amplitude does not.
 - **677 ms is probably contact physics, not electronics** — most likely the viscoelastic
   skin/lever settling session 005 measured at 1.39 mm over 5 s. If so `tau_s` varies with
-  seating depth rather than being a constant. Unresolved.
+  seating depth rather than being a constant. **Both halves confirmed in session 013 — see
+  below.**
+
+### From the lag decomposition (session 013)
+
+- **The 677 ms was never sensor latency, and it is not a constant.** The ToF is non-contact but
+  shares the CAN bus, the tick loop and the motion, so scoring it splits the chain: it lags
+  **0.011–0.098 s** where the tactile arm lags **0.282–0.696 s** across seven runs. The
+  difference is viscoelastic settling in the *contact*. The floor matches the ~8 ms frame
+  period plus the ~11 ms tick, and is an upper bound (the ToF quantises to 1 mm on a 4.8 mm
+  excursion). 0.677 also carried the phantom motor's own ~0.05 s tracking lag, having come from
+  the one run on disk with no `measured_mm`. Measure the floor with `ct-compare --sensor tof_mm`.
+- **Press harder and the sensing gets worse in both respects.** Correlation with the accepted
+  seat peak is **+0.63 for the lag and −0.84 for the amplitude ratio**. Lightest seat
+  (0.362 mm): 0.282 s, 0.760, r = 0.992. Heaviest (1.93 mm): 0.562 s, 0.163, r = 0.806. Deeper
+  seating engages more material in a softer, more dissipative regime and loads the pivot
+  harder. **Seat light. It buys more than any amount of forecasting.**
+- **The lag explains almost none of the attenuation.** Dividing the measured gain by what the
+  lag alone would cause (`1/sqrt(1+(ωτ)²)` — 0.83–0.95 for every run) leaves a *static* gain of
+  0.82 down to 0.19. Delay and attenuation are separate effects that degrade together. Stiction
+  compounds it: samples with exactly zero change go 6.8% → 16.3% with seating depth.
+- **Never freeze a measured lag in a config.** `configs/bench_aligned.yaml` held `horizon: 0.677`
+  and was still using it on runs whose real lag was 0.28 s, where it scored *worse than not
+  forecasting* (0.4135 mm vs 0.3095 mm). `plot_approach_and_seat.py` now assembles `h` per run
+  via `forecast.horizon_from_components`.
+- **A cross-correlation over a periodic signal needs a periodicity guard.** There is a sidelobe
+  every `T_breath` and `argmax` cannot prefer the true one — a ±3 s ToF scan against ~5.8 s
+  breathing returned −2.77 s. `compare_logs` clamps to just inside `T/2` and flags
+  `lag_ambiguous`. Likewise **sensor polarity must be declared, not discovered** (`SENSOR_SIGN`):
+  for a near-sinusoid an inverted sensor is indistinguishable from a correct one half a breath
+  away. And normalise by `sqrt(Ec*Ep)`, not by the overlap count — the latter over-corrects the
+  triangular taper and biases the peak outward.
+- **The EKF loses frequency lock on real subject profiles, and `y_pred` hides it completely.**
+  On run 20260902-160517 Stage 1 finds 10.52 bpm against a true 10.34 and the tracker then runs
+  at **4.55 ± 3.60 bpm**, with `phi_1` spinning **9.70 rad** to absorb the error. `A_k`, `phi_k`
+  and `(theta, omega_r)` are partially redundant, so a drifting `phi_1` mimics a frequency
+  offset and the measurement still fits perfectly — the tracking panel looks flawless. Only the
+  forecast breaks, because it is the one operation using `omega_r` alone: asked to advance
+  0.279 s it advances ~0.031 s. **Check the `frequency lock` line before trusting any forecast
+  number.** Across all seven bench runs, each scored at its own measured lag, the ratio
+  tracked/Stage-1 `omega_r` orders the forecast result monotonically — 0.98 → +60.5%,
+  0.66 → −2.8%, 0.43 → −9.0%, 0.21 → −23.4% — so the forecast failure *is* the frequency
+  failure, not the lag, the horizon, or the sensing chain.
+- **Session 008's +62% headline holds only on the synthetic looping profile.**
+  `breathing_profile_1` is 14.8 s, loops 12× in a 180 s hold and has *zero* baseline wander;
+  `emma_normal_breathing` is 618 s with 0.267 mm of slow wander on a 4.62 mm excursion. Every
+  emma run loses frequency lock (NIS 0.007–0.020); the looping one does not (NIS 0.245). This
+  is session 009's warning about short looping profiles, now reaching the estimator.
+
+### From the EKF tuning analysis (session 015)
+
+- **The 0.349s tactile delay is real, steady-state, and now has a picture, not just a number.**
+  `scripts/plot_lag_detail.py` plots the sensor against phantom ground truth over a few breath
+  periods; unshifted, the sensor visibly peaks and troughs ~0.35s after truth on *every* cycle
+  of `standoff_hold` (already excluding APPROACH/SEAT), and shifting it back by the measured lag
+  snaps the two traces together (correlation 0.912 -> 0.988). This is viscoelastic contact
+  settling happening continuously, not a one-time contact-transient artifact, and has nothing
+  to do with the sensor's ~100Hz sample rate.
+- **A plausible trough-degradation theory was wrong; the real pattern is asymmetric, not
+  symmetric.** The obvious candidate — the measurement Jacobian's `dh/dtheta` vanishing at any
+  extremum, peak or trough alike — is **disconfirmed** on real data
+  (`scripts/analyze_observability.py`): bucketed by `|H_theta|` quartile, the *highest*
+  quartile has the *lowest* forecast error, the opposite of the prediction. The real pattern is
+  asymmetric: trough forecast RMSE is 1.5x peak RMSE (0.224 vs 0.149mm), while peaks are no
+  worse than mid-slope. This points at something contact-specific happening only at end-exhale
+  (loss of skin contact, per `approach.py`'s own docstring, or loading/unloading hysteresis in
+  the viscoelastic material) rather than an information-theoretic property of the harmonic
+  model — still unconfirmed which, and the two remain indistinguishable from one run.
+- **`identifier.params.q_scale` has a sharp, non-monotonic effect on frequency lock, not a
+  smooth trade-off.** Swept 0.1-5.0 on run `20260903-171153` holding R and everything else
+  fixed: frequency lock is completely broken (tracked omega collapses to 1-2bpm against an
+  11.4bpm truth) for `q_scale <= 0.40`, and recovers sharply at `q_scale >= 0.42` — but the
+  recovered band is itself uneven (0.55/0.6 score worse than 0.5/0.7). At `q_scale = 0.5`:
+  NIS 0.052 -> 0.092, frequency-lock std 0.92 -> 0.49bpm, forecast RMSE 0.2056 -> 0.1747mm, lag
+  error removed 33.9% -> 43.9% — a real, simultaneous improvement on every metric, now the
+  default in `configs/bench_aligned.yaml`, but on **one run only**; the bimodal transition
+  itself is evidence Q's per-state structure needs attention, not proof this constant
+  generalizes.
+- **16 calibration breaths (the 180s `--record-s` default already working) was not, by itself,
+  enough to fix the standing NIS/lock shortfall.** CLAUDE.md's prior "more breaths is the first
+  thing to try" is now tried and answered: insufficient alone. Surfaced via a new
+  `_report_q_diagnostics` line in `plot_approach_and_seat.py` that prints `n_breaths` /
+  `omega_source` from `ident.diagnostics['q']`, which `estimate_Q` had always computed but
+  never shown.
+- **No bench run has an in-contact `R` opportunity, and now it's clear why.**
+  `configs/rig_bench.yaml` sets `procedure.approach.breath_hold_s: 15.0`, but that belongs to
+  `ct.control.states.approach` (the real `ct-rig` four-state procedure) —
+  `scripts/run_approach_and_seat.py`, which produces every bench run analyzed so far,
+  implements its own simpler phase machine (`approach`/`seat`/`standoff`/`standoff_hold`) with
+  no breath-hold step at all. Measuring in-contact `R` needs either a `ct-rig` run or a
+  deliberate stationary segment added to the bench script.
+- **No ground-truth leakage into the estimator, confirmed by code trace.** `CSVSource`
+  (`src/ct/sources/csv_source.py`) loads `y` strictly from the configured `y_column`
+  (`sensor_mm`) and `y_clean` only from a column literally named `y_clean`, independent of
+  `y_column`; `y_clean`/`truth` reach only `truth_function`/`forecast_target` for scoring, never
+  `Identifier`/`Tracker`. The EKF beating the raw sensor in places is forecasting doing its job
+  (session 008), not a leak.
+
+### From the multi-profile parameter sweep tooling (session 016)
+
+- **`q_scale=0.5` does not generalize even to a second trial of the same profile.** Run
+  `20260903-185614` (also `emma_normal_breathing.csv`) loses frequency lock at **every**
+  `q_scale` from 0.3 to 1.0, including the pre-session-015 default — a real property of that
+  run, not something the session 015 config change caused. Confirms session 015's own caveat
+  that one run cannot validate a tuning choice, now with a second real data point.
+- **`omega_bounds`, not `q_scale`, may be the more fundamental lever — on a sample of 2 runs,
+  not yet the real answer.** Sweeping `tracker.params.omega_bounds` at ±10% of Stage 1's rate
+  kept **both** available runs locked at every `q_scale` tested, where no `q_scale` value alone
+  could lock `185614` at all. `omega_bounds` clamps the state the `phi`/`omega` redundancy
+  corrupts directly, rather than discouraging drift indirectly through `Q`. Needs the real
+  5-profile x 2-trial sweep (`scripts/sweep_ekf_params.py`) before this is more than a lead.
+- **Bench data collection is now systematic tooling, not one-off scripts.**
+  `scripts/collect_param_sweep_runs.py` runs several profiles x several trials, auto-retracting
+  20mm between attempts (explicitly requested and bounded — see the note on session 014 below)
+  and auto-discarding/retrying an attempt whose `summary.json` shows near-instant contact or an
+  incomplete run, calibrated against the six real runs on disk (good: `contact_t` 2.36-6.43s;
+  bad: 0.0063s and 0.0002s, the session-012 signature). `scripts/sweep_ekf_params.py` then
+  sweeps `q_scale x omega_bounds` over whatever it collected and picks a safety-first winner
+  (disqualify anything that breaks lock on any run), or says plainly that nothing is safe.
+- **Session 014's refused auto-retract and this session's implemented one are not in tension.**
+  014 refused an *unrequested* auto-retract drafted as a side fix to a different problem; this
+  session's 20mm retract between sweep trials was explicitly requested, for this purpose, at
+  this specific bounded distance — exactly the authorization 014 said was the actual bar.
+
+### From the real 10-run sweep (session 018)
+
+- **`q_scale=0.5` alone locks only 2 of 10 real runs; the pair with `omega_bounds=±10%` locks
+  all 10.** The first real 5-profile x 2-trial sweep confirms session 016's n=2 lead at full
+  scale: mean forecast RMSE 0.293mm, max 0.591mm, and it is the only setting (of 44 tested)
+  that avoids the catastrophic-lock failure mode on every collected run. Session 015's fix was
+  real but incomplete — `configs/bench_aligned.yaml` now carries both
+  (`tracker.params.omega_bounds_fraction: 0.1`), resolved at runtime from each run's own
+  Stage-1 rate via `ct.run.resolve_tracker_params()` (a fixed rad/s range can't cover subjects
+  at 10-22bpm; only a bound relative to *this run's* rate can).
+- **Fixing frequency lock does not reliably improve forecast RMSE, even though it should be
+  trusted more.** On `emma_normal_breathing/trial_2`, the tuned config's forecast RMSE
+  (0.56-0.67mm depending on horizon) is *worse* than just reading the raw sensor late
+  (0.27-0.31mm) — visible in `scripts/plot_ekf_detail.py`'s output. Lock and forecast accuracy
+  are separate claims; fixing one is not evidence for the other.
+- **"Massive FFT vs autocorrelation disagreement" (noticed running the sweep) is real but a
+  volume effect, not a magnitude one.** `ct.identification.spectral.coarse_omega` warns above
+  10% disagreement; headline disagreement across the 10 real runs is 0.3-10.8% (junrong
+  10.7-10.8%, derek 9.0-9.5%, both close to the threshold and consistent with session 006's
+  already-known finding that derek's rate drifts within a take). The alarming *volume* comes
+  from `identify()` being called once per `q_scale` in a sweep (11x) with each call re-invoking
+  `coarse_omega` per Q's sliding sub-window (0-6 more times, sometimes far worse than the
+  headline — one sub-window disagreed by 69.8%) — 100+ warnings per sweep run, each with a
+  distinct embedded percentage so Python's default dedup never collapses them.
+  `scripts/analyze_frequency_disagreement.py` gives the clean per-run summary instead.
+- **A parameter sweep that mixes a fractional and an absolute form of the same knob needs both
+  forms stripped between grid points, not just one.** `sweep_ekf_params.py` stripped the
+  resolved `omega_bounds` key from the base config's tracker params but not the newer
+  `omega_bounds_fraction` key; once `bench_aligned.yaml` carried the latter as a baseline
+  default, every "unset" grid point silently inherited it anyway. The tell was numeric, not
+  logical: the "unset" and "0.1" rows came out bit-identical.
 
 ### From the first real subject data (session 006)
 
@@ -444,9 +636,28 @@ capture.
   phantom tracks its own command to 99.1%. `ct-compare --truth measured_mm` can now separate
   the phantom's own tracking lag from the sensing chain's — which no run has done yet, so
   every latency number so far still uses `commanded_mm` and includes both.
-- **Whether the 677 ms lag and the 0.33 amplitude ratio are constants or move with seating
-  depth.** Session 005 measured the related compliance ratio at 0.22-0.68 across runs. If the
-  attenuation moves as much, the estimator sees a time-varying gain.
+- ~~Whether the 677 ms lag and the 0.33 amplitude ratio are constants or move with seating
+  depth~~ **resolved (session 013): they move, strongly.** Lag 0.282-0.696 s and amplitude
+  0.16-0.76 across seven runs, correlating +0.63 and -0.84 with seat depth. The estimator does
+  see a time-varying gain, and the horizon is now measured per run rather than configured.
+- **Why the EKF loses frequency lock on real subject profiles** (session 013). Tracked
+  `omega_r` collapses to 4.55 bpm against a true 10.34 while `y_pred` still fits, which breaks
+  the forecast silently. **Resolved for lock itself (session 018):** the real 5-profile
+  x 2-trial sweep found `q_scale=0.5` + `omega_bounds` at ±10% of Stage 1's rate keeps lock on
+  all 10 real runs (`q_scale` alone locks only 2/10) — now the default in
+  `configs/bench_aligned.yaml`, resolved at runtime via `ct.run.resolve_tracker_params()`.
+  **Still open:** fixing lock does not reliably improve forecast RMSE per run (session 018
+  found the tuned config's forecast *worse* than the raw sensor on one real run) — lock and
+  forecast accuracy are separate claims, and nothing about the forecast should be assumed
+  fixed just because lock now is.
+- **Whether the contact is a delay or a filter.** Phase lag per harmonic on run 160517 is
+  0.287 s at the fundamental and 0.407 s at harmonic 2, where a pure delay predicts a constant.
+  If it holds, harmonic `k` needs a different advance than `k*omega_r*h` — settled decision 4
+  would be right for delay but incomplete for this contact. Not yet a measurement worth acting
+  on: harmonic 2 carries 5.7% of the fundamental's energy and harmonic 3 is noise.
+- **Whether the ToF is simply a better estimator input than the tactile arm.** It sees
+  0.79-1.10 of real excursion at under 0.1 s against the arm's 0.16-0.76 at 0.28-0.70 s. Its
+  1 mm quantisation is a resolution problem with known fixes; the contact lag is physics.
 - Target organ / expected motion amplitude
 - Clinical tolerance epsilon
 - Insertion depth / achievable needle velocity (sets `T_ins`)
@@ -472,11 +683,18 @@ capture.
   Carried from session 001 and now load-bearing. Session 008 measured the realised error
   (0.0888 mm at `h = 0.677 s`), so this can finally be set against something real.
 - **Q, not R, is the leading suspect for the NIS shortfall** (session 008). NIS sits at 0.243
-  with a measured `R`. Q is estimated from breath-to-breath refits over only ~6 breaths in the
-  runs so far; the new 180 s `--record-s` default gives ~18, which is the first thing to try.
+  with a measured `R`. ~~Q is estimated from breath-to-breath refits over only ~6 breaths in the
+  runs so far; the new 180 s `--record-s` default gives ~18, which is the first thing to try.~~
+  **Tried and insufficient alone (session 015):** run `20260903-171153` already used 16
+  breaths and still showed NIS 0.052 before any other change. The next thread is `q_scale`'s
+  sharp transition, above — Q's structure, not the amount of calibration data.
 - **In-contact `R` is unmeasured.** The 7.3e-6 mm² in `bench_aligned.yaml` is free-air with the
   arm unloaded, and so a lower bound. A breath-hold during `standoff_hold` (pause the phantom,
-  set `identifier.params.breath_hold_window`) would measure it properly.
+  set `identifier.params.breath_hold_window`) would measure it properly. **Session 015 found
+  why no bench run has this yet:** `procedure.approach.breath_hold_s` is implemented in
+  `ct.control.states.approach` (the real `ct-rig` procedure), but every bench run so far went
+  through `scripts/run_approach_and_seat.py`'s own simpler phase machine, which has no
+  breath-hold step at all. Needs either a `ct-rig` run or a bench-script change.
 - **Whether the corrected hold-position math actually eliminates the base motor's approach
   overshoot is untested on hardware** as of session 005 — the fix is reasoned from one real
   data point, not yet re-verified by a full run.

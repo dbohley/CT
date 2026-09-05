@@ -35,7 +35,7 @@ def _breath(t: float) -> float:
 
 
 def _logs(tmp_path, *, duration=40.0, lag_s=0.0, scale=1.0, phase="standoff_hold",
-          noise_phases=(), measured_offset=None, t0=1000.0):
+          noise_phases=(), measured_offset=None, t0=1000.0, tof_lag_s=None):
     """A phantom log and a controller log whose sensor lags and scales the phantom.
 
     ``noise_phases`` prepends records in other phases carrying a signal uncorrelated with
@@ -59,8 +59,12 @@ def _logs(tmp_path, *, duration=40.0, lag_s=0.0, scale=1.0, phase="standoff_hold
                                "tactile_mm": 5.0 * math.sin(2 * math.pi * t / 0.7)})
     for i in range(n):
         t = t0 + i / FS
-        controller.append({"t": t, "elapsed": i / FS, "phase": phase,
-                           "tactile_mm": 10.0 + scale * _breath(t - t0 - lag_s)})
+        record = {"t": t, "elapsed": i / FS, "phase": phase,
+                  "tactile_mm": 10.0 + scale * _breath(t - t0 - lag_s)}
+        if tof_lag_s is not None:
+            # The ToF measures DISTANCE, so it moves opposite to the surface it watches.
+            record["tof_mm"] = 130.0 - _breath(t - t0 - tof_lag_s)
+        controller.append(record)
 
     return (_write(tmp_path / "phantom.jsonl", phantom),
             _write(tmp_path / "controller.jsonl", controller))
@@ -165,7 +169,82 @@ def test_asking_for_measured_when_there_is_none_says_so(tmp_path):
         compare_logs(phantom, controller, phase="standoff_hold", phantom_field="measured_mm")
 
 
+# -- splitting sensing latency from contact settling --------------------------
+
+
+def test_the_tof_column_can_be_scored_and_its_inverted_polarity_is_handled(tmp_path):
+    """The ToF is what separates sensor latency from contact settling.
+
+    It is non-contact but shares the bus, the tick loop and the motion, so on the bench it
+    lags 0.014-0.100s where the tactile arm lags 0.279-0.566s -- and the difference is
+    mechanical, not electronic. Its distance reading moves *opposite* to the surface, which
+    has to be handled by orientation rather than discovered: for a near-sinusoid an inverted
+    sensor is indistinguishable from a correctly-signed one half a breath away, and a
+    magnitude-based search picks whichever lobe is nearer.
+    """
+    phantom, controller = _logs(tmp_path, lag_s=0.5, scale=0.3, tof_lag_s=0.05)
+
+    tactile = compare_logs(phantom, controller, phase="standoff_hold", max_lag_s=1.0)
+    tof = compare_logs(phantom, controller, phase="standoff_hold", max_lag_s=1.0,
+                       sensor_field="tof_mm")
+
+    assert tactile["lag_s"] == pytest.approx(0.5, abs=1.5 / FS)
+    assert tof["lag_s"] == pytest.approx(0.05, abs=1.5 / FS)
+    assert tof["sensor_field_used"] == "tof_mm"
+    # Oriented to the phantom, so both read as positive fractions of real excursion and are
+    # directly comparable -- the whole point of measuring the floor this way.
+    assert tof["sensor_sign"] == -1.0
+    assert tof["amplitude_ratio"] == pytest.approx(1.0, abs=0.05)
+    assert tof["correlation"] > 0.99
+    # And the split itself: everything above the floor is contact, not sensing.
+    assert tactile["lag_s"] - tof["lag_s"] == pytest.approx(0.45, abs=0.03)
+
+
+def test_asking_for_a_sensor_column_that_is_not_there_says_so(tmp_path):
+    phantom, controller = _logs(tmp_path)
+    with pytest.raises(ValueError, match="tof_mm"):
+        compare_logs(phantom, controller, phase="standoff_hold", sensor_field="tof_mm")
+
+
 # -- guards -------------------------------------------------------------------
+
+
+def test_the_lag_is_resolved_finer_than_the_sample_grid(tmp_path):
+    """A raw argmax quantises the lag to one grid sample; the horizon deserves better.
+
+    At the bench's ~127 Hz that quantum is 7.9 ms. It was tolerable while the lag was a
+    curiosity and is not now that it sets the forecast horizon per run.
+    """
+    phantom, controller = _logs(tmp_path, lag_s=0.235, scale=0.3)
+    result = compare_logs(phantom, controller, phase="standoff_hold")
+
+    assert result["lag_s"] == pytest.approx(0.235, abs=0.5 / FS)
+    # Strictly better than the grid could express on its own.
+    assert result["lag_s"] not in (0.23, 0.24)
+
+
+def test_a_search_wider_than_half_a_breath_is_clamped_and_flagged(tmp_path):
+    """Breathing is periodic, so the correlation surface is too.
+
+    There is a sidelobe every T_breath and an argmax has no way to prefer the true one. A
+    +-3s scan of the ToF against this bench's ~5.8s breathing came back with -2.77s doing
+    exactly that. The range is clamped to just inside T/2 and the caller is told.
+    """
+    phantom, controller = _logs(tmp_path, lag_s=0.3, scale=0.3)
+
+    wide = compare_logs(phantom, controller, phase="standoff_hold", max_lag_s=3.0)
+
+    assert wide["breath_period_s"] == pytest.approx(BREATH_S, rel=0.05)
+    assert wide["lag_ambiguous"] is True
+    assert wide["max_lag_searched_s"] < 0.5 * BREATH_S
+    # Clamped, but still correct -- the guard narrows the search, it does not break it.
+    assert wide["lag_s"] == pytest.approx(0.3, abs=1.5 / FS)
+
+    narrow = compare_logs(phantom, controller, phase="standoff_hold", max_lag_s=1.0)
+    assert narrow["lag_ambiguous"] is False
+
+
+
 
 
 def test_lag_peak_against_the_search_edge_is_flagged(tmp_path):

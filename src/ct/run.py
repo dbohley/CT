@@ -60,6 +60,27 @@ class PipelineResult:
         return StateLayout(self.ident.K)
 
 
+def resolve_tracker_params(params: dict[str, Any] | None, ident_bpm: float) -> dict[str, Any]:
+    """Resolve ``omega_bounds_fraction`` into an absolute ``omega_bounds`` pair.
+
+    A fixed rad/s range in a config can't generalize across subjects at very different
+    breathing rates (10-22bpm across the profiles in ``outputs/param_sweep_runs``) -- the
+    parameter sweep that found a tight bound fixes frequency lock found it works *because* it
+    tracks this run's own Stage-1 rate, not a constant. ``omega_bounds_fraction`` expresses
+    that relationship; this is where it gets turned into what
+    :class:`ct.tracking.harmonic_ekf.HarmonicEKF` actually takes. A no-op when the key is
+    absent, so every existing config is unaffected.
+    """
+    from ct.identification.spectral import bpm_to_omega  # noqa: PLC0415
+
+    resolved = dict(params or {})
+    frac = resolved.pop("omega_bounds_fraction", None)
+    if frac is not None:
+        omega_hat = bpm_to_omega(ident_bpm)
+        resolved["omega_bounds"] = [omega_hat * (1.0 - frac), omega_hat * (1.0 + frac)]
+    return resolved
+
+
 def build_source_from_config(cfg: RunConfig):
     params = dict(cfg.source.get("params") or {})
     # fs/seed live at the top level of the config so every stage agrees on them;
@@ -160,7 +181,8 @@ def run_pipeline(cfg: RunConfig, warmup_breaths: float = 2.0) -> PipelineResult:
     identifier = build_identifier(cfg.identifier["name"], cfg.identifier.get("params"))
     ident = identifier.identify(calibration)
 
-    tracker = build_tracker(cfg.tracker["name"], cfg.tracker.get("params"))
+    tracker_params = resolve_tracker_params(cfg.tracker.get("params"), ident.diagnostics["bpm_hat"])
+    tracker = build_tracker(cfg.tracker["name"], tracker_params)
     history = track(
         tracker,
         tracking,
@@ -218,7 +240,8 @@ def sweep_horizons(cfg: RunConfig, horizons: list[float]) -> list[dict[str, Any]
 
     identifier = build_identifier(cfg.identifier["name"], cfg.identifier.get("params"))
     ident = identifier.identify(calibration)
-    tracker = build_tracker(cfg.tracker["name"], cfg.tracker.get("params"))
+    tracker_params = resolve_tracker_params(cfg.tracker.get("params"), ident.diagnostics["bpm_hat"])
+    tracker = build_tracker(cfg.tracker["name"], tracker_params)
 
     layout = StateLayout(ident.K)
     from ct.forecast import forecast_value

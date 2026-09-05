@@ -206,3 +206,140 @@ class AmplitudeWatcher:
     @property
     def trough(self) -> float:
         return min(self._y) if self._y else 0.0
+
+
+class BreathPeakWatcher:
+    """The typical breathing peak, measured over a whole number of real breaths.
+
+    Standoff positions the base so the *breathing peak* of the tactile deflection lands on a
+    target. Getting that number right needs an estimator that is both unbiased and phrased in
+    breaths rather than seconds, for two reasons that each cost a real bench run.
+
+    **``max`` over a time window is biased, and the bias grows with the window.** Real
+    breathing varies breath to breath: over 34 breaths of the ``emma_normal_breathing``
+    profile the per-breath peak has mean 2.125 mm and std 0.540 mm. The maximum of ``N``
+    draws from that sits above the typical peak by an amount that grows with ``N`` --
+    +0.30 mm at 2 breaths, +0.59 at 4, +0.84 at 8. Because standoff *retreats* whenever the
+    measured peak exceeds its target, that bias alone drives spurious retreats, and
+    "measuring more carefully" by waiting longer makes it strictly worse. The mean of the
+    per-breath peaks has no such bias, and its standard error falls the way an average
+    should: 0.382 mm at 2 breaths, 0.270 at 4, 0.190 at 8.
+
+    **A fixed time window is not a fixed number of breaths.** The caller's
+    ``min_breaths * nominal_breath_s`` gave 2.0 x 4.0 = 8.0 s, but the same profile really
+    breathes at 5.51 s, so "two breaths" was 1.45 of them -- sometimes containing two peaks
+    and sometimes one. Counting real breaths removes the dependence on a nominal period that
+    nothing keeps honest, and :attr:`period_s` reports what the breathing actually was.
+
+    Breaths are segmented at upward crossings of the running mean, with hysteresis at a
+    fraction of the observed amplitude so that noise near the mean cannot split one breath
+    into several. Only *completed* breaths count, so a partial one at either end is never
+    mistaken for a shallow one.
+
+    Validated against real data: 33 breaths found in 180 s of ``emma_normal_breathing``
+    against a zero-crossing reference of 37, and 10 against 11 on the tactile trace of run
+    ``20260903-152502``. The shortfall is the partial breaths at each end, which is the
+    intended behaviour. The trailing reference window means the crossing level tracks slow
+    baseline wander (emma drifts -0.00513 mm/s), but a baseline moving as fast as the
+    breathing amplitude itself would still defeat it -- roughly ten times the rate the bench
+    has ever shown.
+    """
+
+    def __init__(self, n_breaths: float = 2.0, hysteresis_fraction: float = 0.15,
+                 reference_window_s: float = 30.0) -> None:
+        self.n_breaths = max(1, int(n_breaths))
+        self.hysteresis_fraction = float(hysteresis_fraction)
+        # The crossing level and the hysteresis band are computed over a trailing window, not
+        # over everything seen. Against the whole history any base motion in the record --
+        # even one step -- inflates max-min far past the breathing amplitude, the band grows
+        # with it, and the signal then never crosses: replaying run 20260903-152502's whole
+        # standoff phase this way detects *zero* breaths in 66s of clearly breathing data.
+        self.reference_window_s = float(reference_window_s)
+        self._t: deque[float] = deque()
+        self._y: deque[float] = deque()
+        self._peaks: list[float] = []
+        self._starts: list[float] = []
+        self._current_peak: float | None = None
+        self._current_start: float | None = None
+        self._above = False
+
+    def reset(self) -> None:
+        """Forget everything. Called after each base step, so no sample from before the
+        move can contribute to the measurement that judges where the move landed."""
+        self._t.clear()
+        self._y.clear()
+        self._peaks.clear()
+        self._starts.clear()
+        self._current_peak = None
+        self._current_start = None
+        self._above = False
+
+    def add(self, t: float, y: float) -> None:
+        self._t.append(t)
+        self._y.append(y)
+        while self._t and (t - self._t[0]) > self.reference_window_s:
+            self._t.popleft()
+            self._y.popleft()
+        if len(self._y) < 8:
+            return
+
+        # Reference the running mean rather than a fixed level: a real subject profile
+        # carries ~1.5mm of slow baseline wander (session 009), which a fixed threshold
+        # would eventually sit outside entirely.
+        values = np.fromiter(self._y, dtype=float)
+        mean = float(values.mean())
+        amplitude = float(values.max() - values.min())
+        band = self.hysteresis_fraction * amplitude
+
+        if self._above:
+            if y < mean - band:
+                # Breath complete: bank its peak and wait for the next upward crossing.
+                if self._current_peak is not None and self._current_start is not None:
+                    self._peaks.append(self._current_peak)
+                    self._starts.append(self._current_start)
+                self._current_peak = None
+                self._current_start = None
+                self._above = False
+            elif self._current_peak is None or y > self._current_peak:
+                self._current_peak = y
+        elif y > mean + band:
+            self._above = True
+            self._current_peak = y
+            self._current_start = t
+
+    @property
+    def breaths(self) -> int:
+        """Completed breaths observed since the last reset."""
+        return len(self._peaks)
+
+    @property
+    def ready(self) -> bool:
+        return self.breaths >= self.n_breaths
+
+    @property
+    def peak(self) -> float:
+        """Mean of the last ``n_breaths`` per-breath peaks. Unbiased; see the class docstring."""
+        if not self._peaks:
+            return 0.0
+        recent = self._peaks[-self.n_breaths:]
+        return float(np.mean(recent))
+
+    @property
+    def peak_spread(self) -> float:
+        """Peak-to-peak spread of the breaths being averaged.
+
+        How much the subject's own breathing varied over the measurement, which is the floor
+        on how tightly standoff can position. Worth reporting next to the tolerance.
+        """
+        recent = self._peaks[-self.n_breaths:]
+        return float(max(recent) - min(recent)) if len(recent) >= 2 else 0.0
+
+    @property
+    def period_s(self) -> float | None:
+        """Mean detected breath period, or None before two breaths have started."""
+        if len(self._starts) < 2:
+            return None
+        starts = self._starts[-(self.n_breaths + 1):]
+        if len(starts) < 2:
+            return None
+        return float((starts[-1] - starts[0]) / (len(starts) - 1))

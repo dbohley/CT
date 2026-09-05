@@ -45,10 +45,26 @@ breathing window with the base stationary and settled:
 - *coarse* -- advance continuously at ``--creep-speed-mm-s`` until the instantaneous reading
   reaches ``--standoff-coarse-fraction`` of the target (default 0.5). Deliberately short, so
   coarse cannot overshoot even if it stops at a breathing trough.
-- *fine* -- stop, settle, and measure the windowed peak, requiring **two consecutive windows to
-  agree within ``--standoff-tol-mm``** before trusting it. Then step toward the target (sized
-  from the compliance ratio measured during this run, under-stepped so it converges from
-  below), or retreat if the settled peak came out above target, and re-measure.
+- *fine* -- stop, wait out the settling, then measure the breathing peak as the **mean of
+  ``--min-breaths`` counted breaths**. Accept anywhere in ``target +/- --standoff-tol-mm``;
+  otherwise step toward the target (sized from the compliance ratio measured during this run,
+  under-stepped so it converges from below), or retreat if the peak came out above the band,
+  and re-measure. Once accepted the base does not move again for the rest of the run.
+
+Both halves of that measurement were wrong until 2026-09-03, and together they cost a run
+(13 fine steps, 6 retreats, 325s, cancelled, against 3 steps for the run before it):
+
+- The peak was the ``max`` over a fixed time window, which is **biased high by the subject's
+  own breath-to-breath variation**, and biased further the longer you wait. Replayed over the
+  stationary measurement segments of that day's two runs it read +0.48 and +0.54mm high, worst
+  case +1.77mm, against a 0.30mm tolerance -- so the loop retreated from positions that were
+  actually short of target. The mean of a counted number of whole breaths has no such bias.
+- The window was ``--min-breaths * --nominal-breath-s`` = 2 x 4.0s, but the profile really
+  breathes at 5.5s, so "two breaths" was 1.45 of them. Counting real breaths removes the
+  dependence on a nominal period that nothing keeps honest.
+
+The acceptance band was also one-sided (``[target-tol, target]``), so any over-read cost a
+base move rather than being tolerated. It is two-sided now.
 
 An instantaneous reading taken while moving cannot decide acceptance, and run 20260901-161845
 is the proof: the base stopped with the reading at exactly 6.007mm and never moved again, yet
@@ -129,7 +145,7 @@ import can
 import numpy as np
 
 from ct.cli._common import save_json
-from ct.control.live import AmplitudeWatcher
+from ct.control.live import AmplitudeWatcher, BreathPeakWatcher
 from ct.hw.bus import build_bus_from_config
 from ct.hw.config import BusConfig
 from ct.hw.motors.cubemars_mit import CubeMarsMIT
@@ -152,6 +168,16 @@ CLEAR_ERRORS = bytes([0xFF] * 7 + [0xFB])
 MOTOR_REPLY_P_MIN, MOTOR_REPLY_P_MAX = -12.5, 12.5
 MOTOR_REPLY_V_MIN, MOTOR_REPLY_V_MAX = -200.0, 200.0
 MOTOR_REPLY_T_MIN, MOTOR_REPLY_T_MAX = -10.0, 10.0  # torque (N*m) range unconfirmed for GL-II
+# -----------------------------------------------------------------------------------------------------
+
+# ---------------- Retract-only mode (session 015: automated between-trial reset) -----------------
+# A bounded, standalone base move -- no sensors, no phantom, no approach/seat/standoff state
+# machine -- so a multi-trial sweep orchestrator can reset the base between physical trials
+# without an operator backing it off by hand each time. Mirrors run_breathing_profile.py's
+# read_fresh_position_rad exactly: bus.recv() returns the OLDEST queued frame, so a position
+# read taken without flushing first can be stale by the ~25-frame margin session 012 measured.
+RETRACT_FLUSH_MAX = 256
+RETRACT_POSITION_TIMEOUT_S = 2.0
 # -----------------------------------------------------------------------------------------------------
 
 # ---------------- Sensor config (mirrors ct.cli.sensor_bench / measure_sensor_noise.py) ----------------
@@ -189,13 +215,33 @@ DEFAULT_TARE_S = 2.0
 TARE_CONTACT_P2P_MM = 0.3
 DEFAULT_VELOCITY_RAD_S = 0.1  # approach + retract velocity
 DEFAULT_CONTACT_THRESHOLD_CM = 0.01
-DEFAULT_STANDOFF_DIST_CM = .8  # empirical: needle (unactuated, fully retracted) sits close to but not touching skin here
+DEFAULT_STANDOFF_DIST_CM = .9  # empirical: needle (unactuated, fully retracted) sits close to but not touching skin here
 # Coarse continuous advance stops here, well short of the target, because an instantaneous
 # reading taken while moving understates the settled breathing peak by the swing plus the
 # viscoelastic rise (measured together at ~2.5mm in run 20260901-161845). Half the target
 # leaves more headroom than that, so coarse cannot overshoot even if it stops at a trough.
 DEFAULT_STANDOFF_COARSE_FRACTION = 0.5
-DEFAULT_STANDOFF_TOL_MM = 0.3  # acceptance band on the settled peak, below the target only
+DEFAULT_STANDOFF_TOL_MM = 0.3
+"""Half-width of the accept band on the measured breathing peak, applied on BOTH sides.
+
+It used to be one-sided -- accept in ``[target-tol, target]``, retreat above ``target`` -- and
+that made overshoot cost a base move. Combined with a peak estimator biased ~0.5mm high (see
+BreathPeakWatcher) the controller oscillated: run 20260903-152958 took 13 fine steps with 6
+retreats over 325s and never converged, against 3 steps for the run before it.
+
+0.3mm is viable only because the bias is gone. With an unbiased mean over two real breaths the
+standard error is ~0.38mm, so a two-sided 0.3 accepts ~56% of attempts (91% within three
+steps); raise it to 0.5 for ~81% per attempt if the extra steps are more annoying than the
+extra millimetre is harmful.
+"""
+
+DEFAULT_STANDOFF_MAX_STEPS = 8
+"""Give up after this many fine steps, the way approach gives up on travel (session 009).
+
+Not a tuning knob so much as an admission that the loop can fail: a controller with no way to
+stop is one the operator has to cancel, which is what happened on 2026-09-03, and a cancelled
+run reports nothing about why.
+"""
 STANDOFF_ADVANCE_SAFETY = 0.6  # under-step when advancing, so the peak converges from below
 STANDOFF_RETREAT_SAFETY = 0.8  # correcting an overshoot: get out of the unsafe zone promptly
 STANDOFF_MIN_STEP_MM = 0.1
@@ -309,6 +355,108 @@ def at_trough(tactile_mm: float, watcher: AmplitudeWatcher) -> bool:
     return tactile_mm <= watcher.trough + 0.2 * span
 
 
+def _read_fresh_base_position_rad(motor_bus, motor_reply_codec) -> float | None:
+    """Position from a reply broadcast *after* this call, not one already queued.
+
+    Same reasoning as run_breathing_profile.py's read_fresh_position_rad, against this file's
+    own base-motor codec (CubeMarsMIT) rather than the phantom's CubeMarsServo.
+    """
+    for _ in range(RETRACT_FLUSH_MAX):
+        if motor_bus.recv(timeout=0.0) is None:
+            break
+    deadline = time.monotonic() + RETRACT_POSITION_TIMEOUT_S
+    while time.monotonic() < deadline:
+        msg = motor_bus.recv(timeout=0.05)
+        if msg is None:
+            continue
+        parsed = motor_reply_codec.parse(msg.arbitration_id, bytes(msg.data))
+        if parsed is not None and int(parsed["node_id"]) == MOTOR_NODE_ID:
+            return float(parsed["position"])
+    return None
+
+
+def retract_only(retract_mm: float, velocity_rad_s: float, dry_run: bool) -> int:
+    """Back the base off by ``retract_mm`` and exit -- no sensors, no phantom, no state machine.
+
+    Exists so a multi-trial sweep orchestrator (``scripts/collect_param_sweep_runs.py``) can
+    reset the base between physical trials without an operator doing it by hand each time --
+    explicitly requested for that purpose, at this specific bounded distance, which is the
+    authorization session 014's finding said was the actual bar (that session refused an
+    *unrequested* auto-retract drafted as a side fix to a different problem). No interactive
+    confirm: the orchestrator already asks once before the whole batch, and this is a single
+    bounded move on one axis, not the full four-phase procedure the normal confirm() describes.
+
+    The existing loaded-tare refusal in the normal run path is untouched and stays the real
+    backstop -- if the arm is genuinely still loaded beyond what this clears, the *next*
+    trial's tare check refuses exactly as it does today, rather than this mode trying to be a
+    second safety system.
+    """
+    print(f"retract-only: backing off {retract_mm:.1f}mm at {velocity_rad_s:.3f}rad/s")
+    if dry_run:
+        print("--dry-run: not opening any bus.")
+        print("  ", universal_command(MOTOR_NODE_ID, CLEAR_ERRORS))
+        print("  ", universal_command(MOTOR_NODE_ID, ENTER_MODE))
+        print(f"   <read current position, then command it minus {mm_to_rad(retract_mm):.4f}rad "
+              f"at {velocity_rad_s:.3f}rad/s>")
+        print("  ", universal_command(MOTOR_NODE_ID, EXIT_MODE), " <- sent on exit")
+        return 0
+
+    motor_bus = can.interface.Bus(channel=MOTOR_CAN_CHANNEL, interface=MOTOR_CAN_INTERFACE,
+                                   bitrate=MOTOR_BITRATE)
+    motor_reply_codec = CubeMarsMIT(
+        p_min=MOTOR_REPLY_P_MIN, p_max=MOTOR_REPLY_P_MAX,
+        v_min=MOTOR_REPLY_V_MIN, v_max=MOTOR_REPLY_V_MAX,
+        t_min=MOTOR_REPLY_T_MIN, t_max=MOTOR_REPLY_T_MAX,
+    )
+    motion_commanded = False
+    ok = False
+    try:
+        motor_bus.send(universal_command(MOTOR_NODE_ID, CLEAR_ERRORS))
+        time.sleep(0.1)
+        motor_bus.send(universal_command(MOTOR_NODE_ID, ENTER_MODE))
+        time.sleep(0.5)
+
+        start_rad = _read_fresh_base_position_rad(motor_bus, motor_reply_codec)
+        if start_rad is None:
+            print(f"error: no reply from the base motor within {RETRACT_POSITION_TIMEOUT_S:.1f}s "
+                  f"-- not commanding a move with no known starting position.")
+            return 1
+
+        # Retracting is moving AWAY from the phantom, i.e. the opposite of mm_to_rad's
+        # "toward the phantom" convention (used everywhere else in this file for --travel-mm).
+        target_rad = start_rad - mm_to_rad(retract_mm)
+        print(f"  current position {start_rad:.4f}rad -> target {target_rad:.4f}rad "
+              f"({retract_mm:.1f}mm back)")
+        motor_bus.send(build_pos_vel_frame(MOTOR_NODE_ID, target_rad, velocity_rad_s))
+        motion_commanded = True
+
+        timeout_s = abs(mm_to_rad(retract_mm)) / max(velocity_rad_s, 1e-6) + 15.0
+        deadline = time.monotonic() + timeout_s
+        last_position = start_rad
+        while time.monotonic() < deadline:
+            motor_bus.send(build_pos_vel_frame(MOTOR_NODE_ID, target_rad, velocity_rad_s))
+            msg = motor_bus.recv(timeout=0.05)
+            if msg is not None:
+                parsed = motor_reply_codec.parse(msg.arbitration_id, bytes(msg.data))
+                if parsed is not None and int(parsed["node_id"]) == MOTOR_NODE_ID:
+                    last_position = float(parsed["position"])
+                    error_mm = abs(last_position - target_rad) * DRUM_RADIUS_M * 1000.0
+                    if error_mm <= APPROACH_ARRIVAL_TOL_MM:
+                        ok = True
+                        break
+            time.sleep(0.02)
+        if not ok:
+            print(f"error: did not settle within {timeout_s:.1f}s "
+                  f"(last known position {last_position:.4f}rad, target {target_rad:.4f}rad)")
+    except KeyboardInterrupt:
+        print("\nstopped by Ctrl+C.")
+    finally:
+        if motion_commanded:
+            motor_bus.send(universal_command(MOTOR_NODE_ID, EXIT_MODE))
+        motor_bus.shutdown()
+    return 0 if ok else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--travel-mm", type=float, default=DEFAULT_TRAVEL_MM,
@@ -329,7 +477,17 @@ def main() -> int:
                               "stops and the step/settle/measure fine loop takes over")
     parser.add_argument("--standoff-tol-mm", type=float, default=DEFAULT_STANDOFF_TOL_MM,
                          dest="standoff_tol_mm",
-                         help="how close the settled breathing peak must be to the target to accept")
+                         help="half-width of the accept band around the standoff target. "
+                              "Two-sided: the peak is accepted anywhere in [target-tol, "
+                              "target+tol] and only retreats above it")
+    parser.add_argument("--standoff-max-steps", type=int, default=DEFAULT_STANDOFF_MAX_STEPS,
+                         dest="standoff_max_steps",
+                         help="give up after this many fine steps, as a named fault naming the "
+                              "peaks and the band, rather than stepping forever")
+    parser.add_argument("--allow-loaded-tare", dest="allow_loaded_tare", action="store_true",
+                         help="tare even if the arm is already in contact. Off by default: such "
+                              "a zero hides real contact and every depth downstream is measured "
+                              "from a datum that was never established")
     parser.add_argument("--creep-increment-mm", type=float, default=DEFAULT_CREEP_INCREMENT_MM)
     parser.add_argument("--creep-speed-mm-s", type=float, default=DEFAULT_CREEP_SPEED_MM_S)
     parser.add_argument("--min-breaths", type=float, default=DEFAULT_MIN_BREATHS)
@@ -359,7 +517,19 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=None,
                          help="output directory; default outputs/approach_and_seat/<timestamp>")
     parser.add_argument("--dry-run", action="store_true", help="print what would be sent, send nothing")
+    parser.add_argument("--yes", action="store_true",
+                         help="skip the interactive confirmation before commanding motion -- "
+                              "for automated use (e.g. scripts/collect_param_sweep_runs.py), "
+                              "mirroring run_breathing_profile.py's --yes")
+    parser.add_argument("--retract-only-mm", type=float, default=None, dest="retract_only_mm",
+                         help="back the base off by this many mm and exit -- no sensors, no "
+                              "phantom, no approach/seat/standoff. For resetting between trials "
+                              "in an automated multi-trial sweep (scripts/collect_param_sweep_runs.py); "
+                              "ignores every other approach/seat/standoff flag.")
     args = parser.parse_args()
+
+    if args.retract_only_mm is not None:
+        return retract_only(args.retract_only_mm, args.velocity, args.dry_run)
 
     if args.travel_mm > args.max_approach_mm:
         print(f"error: --travel-mm {args.travel_mm:.1f} exceeds --max-approach-mm "
@@ -384,8 +554,10 @@ def main() -> int:
           f"for {args.stable_increments} checks in a row (cap {args.max_seat_increments} increments)")
     print(f"phase 3 standoff: coarse advance at {args.creep_speed_mm_s:.2f}mm/s to "
           f"{args.standoff_coarse_fraction:.0%} of target, then fine step/settle/measure until the "
-          f"SETTLED breathing peak lands in [{target_mm - args.standoff_tol_mm:.2f}, {target_mm:.2f}]mm "
-          f"(retreating if it overshoots) -- closed loop on the sensor, no distance bound")
+          f"breathing peak, averaged over {args.min_breaths:g} counted breaths, lands in "
+          f"[{target_mm - args.standoff_tol_mm:.2f}, {target_mm + args.standoff_tol_mm:.2f}]mm "
+          f"(retreating only above it), giving up after {args.standoff_max_steps} steps -- "
+          f"closed loop on the sensor, no distance bound")
     print(f"phase 4 standoff_hold: record for {args.record_s:.0f}s")
     print(f"resending the current target at {args.command_hz:.0f}Hz. This script never commands the needle motor.")
 
@@ -421,7 +593,7 @@ def main() -> int:
           f"past first contact to find true max breathing amplitude, creep further to standoff, and "
           f"hold+record for {args.record_s:.0f}s.{phantom_note} Watch it closely. Ctrl+C stops and "
           f"de-energizes at any point.")
-    if not confirm("Proceed?"):
+    if not args.yes and not confirm("Proceed?"):
         print("aborted.")
         return 1
 
@@ -526,8 +698,15 @@ def main() -> int:
     standoff_step_remaining_mm = 0.0   # of the current fine step still to travel
     standoff_step_sign = 1.0           # +1 advancing deeper, -1 retreating
     standoff_retreat_steps = 0
-    standoff_prev_peak_mm: float | None = None  # previous window's peak, for the agreement check
     standoff_settled_peak_mm: float | None = None
+    standoff_recent_peaks: list[float] = []     # for the give-up message
+    # Standoff measures the breathing peak over whole real breaths, not a fixed time window.
+    # See BreathPeakWatcher: max-over-window is biased high by the spread of the subject's own
+    # breathing, and standoff RETREATS whenever the reading exceeds target, so that bias drives
+    # spurious retreats. Replayed over the stationary measurement segments of the two runs on
+    # 2026-09-03, max-over-8s read +0.48 and +0.54mm higher than the mean of two real breaths
+    # (worst single segment +1.77mm) -- against a 0.30mm tolerance.
+    breath_watcher = BreathPeakWatcher(n_breaths=args.min_breaths)
     standoff_crossed_t: float | None = None
     hold_started_at: float | None = None
     fault_reason: str | None = None
@@ -610,11 +789,25 @@ def main() -> int:
                   f"p2p {tare['p2p_mm']:.4f}mm, {tare['n']} samples)")
             if tare["p2p_mm"] > TARE_CONTACT_P2P_MM:
                 tare_contact_warned = True
-                print(f"\n  WARNING: the arm is swinging {tare['p2p_mm']:.3f}mm over the tare "
-                      f"window, above the {TARE_CONTACT_P2P_MM:.2f}mm expected of a free arm. "
-                      f"It looks like it is already riding the phantom's breathing, i.e. in "
-                      f"real contact -- and taring will zero that out, so the base will drive "
-                      f"in from an already-loaded state. Retract it if that is not intended.\n")
+                # A free arm reads 0.014mm p2p here; one riding the phantom read 8.330mm on
+                # 2026-09-03. The tare's whole premise is that the sensor starts out of
+                # contact, as it does in a real procedure, and a zero taken mid-swing hides
+                # real contact: run 20260903-152958 then declared contact at t=0.006s, skipped
+                # APPROACH entirely, seated at 0.219mm and never converged. If the base was
+                # left in contact from a previous run, back it off by hand before this one.
+                message = (
+                    f"the arm is swinging {tare['p2p_mm']:.3f}mm over the tare window, above "
+                    f"the {TARE_CONTACT_P2P_MM:.2f}mm expected of a free arm, so it is already "
+                    f"riding the phantom rather than resting clear of it. Taring now would zero "
+                    f"out real contact and every depth this run reports would be measured from "
+                    f"a datum that was never established. Retract the base until the arm is "
+                    f"free, then re-run (or pass --allow-loaded-tare to proceed anyway)."
+                )
+                if args.allow_loaded_tare:
+                    print(f"\n  WARNING: {message}\n")
+                else:
+                    fault_reason = message
+                    raise SetupFailed
 
         t0 = time.monotonic()
         print("commanding approach...")
@@ -683,8 +876,7 @@ def main() -> int:
                             settling_until = elapsed + settle_time_s(
                                 args.creep_increment_mm, args.creep_speed_mm_s
                             )
-                            standoff_prev_peak_mm = None
-                            watcher.reset()
+                            breath_watcher.reset()
                     signed_mm = standoff_step_sign * step_mm
                     current_target_rad = current_target_rad + mm_to_rad(signed_mm)
                     standoff_advanced_mm += signed_mm
@@ -883,25 +1075,39 @@ def main() -> int:
                             standoff_advancing = False
                             current_target_rad = hold_basis_rad(elapsed)
                             settling_until = elapsed + settle_time_s(args.creep_increment_mm, args.creep_speed_mm_s)
-                            standoff_prev_peak_mm = None
-                            watcher.reset()
+                            breath_watcher.reset()
                             print(f"  standoff: coarse advance done at t={elapsed:.3f}s "
                                   f"(reading {tactile_mm:.3f}mm, {standoff_advanced_mm:.2f}mm travelled) "
                                   f"-- switching to fine step/settle/measure")
                     elif elapsed >= settling_until:
-                        watcher.add(elapsed, tactile_mm)
-                        if watcher.full:
-                            peak_mm = watcher.peak
-                            # Require two consecutive full windows to agree before trusting the
-                            # peak. This is what waits out the viscoelastic settling without
-                            # needing to know its duration: while the lever is still sinking,
-                            # successive windows keep reading higher and cannot agree.
-                            settled = (standoff_prev_peak_mm is not None
-                                       and abs(peak_mm - standoff_prev_peak_mm) <= args.standoff_tol_mm)
-                            if not settled:
-                                standoff_prev_peak_mm = peak_mm
-                                watcher.reset()
-                            elif peak_mm > target_mm:
+                        # settling_until already waited out the viscoelastic settling. The
+                        # old extra gate -- two consecutive windows agreeing within tol --
+                        # was meant to do the same job, but real breath-to-breath variation
+                        # defeats it: only 44-56% of consecutive window pairs on this bench
+                        # agree within 0.30mm, so it was a coin flip on every attempt rather
+                        # than a settling test. Removed; the fixed timer does the real work.
+                        breath_watcher.add(elapsed, tactile_mm)
+                        if breath_watcher.ready:
+                            peak_mm = breath_watcher.peak
+                            standoff_recent_peaks.append(peak_mm)
+                            lo = target_mm - args.standoff_tol_mm
+                            hi = target_mm + args.standoff_tol_mm
+                            if standoff_segments >= args.standoff_max_steps:
+                                recent = ", ".join(f"{p:.3f}" for p in standoff_recent_peaks[-5:])
+                                fault_reason = (
+                                    f"standoff did not settle in {standoff_segments} fine "
+                                    f"step(s) ({standoff_advanced_mm:.1f}mm advanced, "
+                                    f"{standoff_retreat_steps} retreat(s)). Last peaks: "
+                                    f"{recent} against band [{lo:.2f}, {hi:.2f}]mm. Either "
+                                    f"--standoff-tol-mm {args.standoff_tol_mm:.2f} is tighter "
+                                    f"than this subject's breath-to-breath spread "
+                                    f"({breath_watcher.peak_spread:.3f}mm over the last "
+                                    f"{args.min_breaths:g} breaths), or the target is out of "
+                                    f"reach at this seating."
+                                )
+                                stop_motor("standoff did not settle")
+                                done = True
+                            elif peak_mm > hi:
                                 # Overshot -- already pressed deeper than intended. Backing off
                                 # is the correction (never the approach strategy: coarse/fine is
                                 # what keeps this rare).
@@ -911,19 +1117,28 @@ def main() -> int:
                                 standoff_advancing = True
                                 standoff_segments += 1
                                 standoff_retreat_steps += 1
-                                standoff_prev_peak_mm = None
-                                watcher.reset()
-                                print(f"  standoff fine step {standoff_segments}: settled peak "
-                                      f"{peak_mm:.3f}mm > target {target_mm:.1f}mm -- RETREATING "
-                                      f"{step:.2f}mm")
-                            elif peak_mm >= target_mm - args.standoff_tol_mm:
+                                breath_watcher.reset()
+                                print(f"  standoff fine step {standoff_segments}: peak "
+                                      f"{peak_mm:.3f}mm over {args.min_breaths:g} breaths, need "
+                                      f"[{lo:.2f}, {hi:.2f}] ({peak_mm - hi:.2f}mm high) -- "
+                                      f"RETREATING {step:.2f}mm  [retreats: {standoff_retreat_steps}]")
+                            elif peak_mm >= lo:
+                                # Accept and COMMIT. Nothing may move the base after this: the
+                                # whole point of the hold is a stationary base under a breathing
+                                # phantom, and a late correction would put a step transient into
+                                # the middle of the record the estimator is scored on.
                                 standoff_settled_peak_mm = peak_mm
                                 standoff_crossed_t = elapsed
                                 phase = "standoff_hold"
                                 hold_started_at = elapsed
+                                standoff_advancing = False
+                                standoff_step_remaining_mm = 0.0
+                                period = breath_watcher.period_s
+                                period_note = f", breathing at {period:.2f}s" if period else ""
                                 print(f"\nSTANDOFF reached at t={elapsed:.3f}s after {standoff_segments} "
-                                      f"segment(s), settled peak={peak_mm:.3f}mm (target "
-                                      f"{target_mm:.1f}mm +/- {args.standoff_tol_mm:.2f}) -- holding "
+                                      f"segment(s), peak={peak_mm:.3f}mm over {args.min_breaths:g} "
+                                      f"breaths (target {target_mm:.1f} +/- {args.standoff_tol_mm:.2f}, "
+                                      f"band [{lo:.2f}, {hi:.2f}]{period_note}) -- base now holding "
                                       f"and recording for {args.record_s:.0f}s")
                             else:
                                 step = standoff_step_mm(peak_mm, target_mm, STANDOFF_ADVANCE_SAFETY)
@@ -931,11 +1146,11 @@ def main() -> int:
                                 standoff_step_sign = 1.0
                                 standoff_advancing = True
                                 standoff_segments += 1
-                                standoff_prev_peak_mm = None
-                                watcher.reset()
-                                print(f"  standoff fine step {standoff_segments}: settled peak "
-                                      f"{peak_mm:.3f}mm < target {target_mm:.1f}mm -- advancing "
-                                      f"{step:.2f}mm")
+                                breath_watcher.reset()
+                                print(f"  standoff fine step {standoff_segments}: peak "
+                                      f"{peak_mm:.3f}mm over {args.min_breaths:g} breaths, need "
+                                      f"[{lo:.2f}, {hi:.2f}] ({lo - peak_mm:.2f}mm low) -- "
+                                      f"advancing {step:.2f}mm  [retreats: {standoff_retreat_steps}]")
 
                 elif phase == "standoff_hold":
                     if hold_started_at is not None and (elapsed - hold_started_at) >= args.record_s:
@@ -1053,6 +1268,23 @@ def main() -> int:
             "settled_peak_mm": standoff_settled_peak_mm,
             "final_stage": standoff_stage,
             "retreat_steps": standoff_retreat_steps,
+            "max_steps": args.standoff_max_steps,
+            "accept_band_mm": [
+                args.standoff_dist_cm * 10.0 - args.standoff_tol_mm,
+                args.standoff_dist_cm * 10.0 + args.standoff_tol_mm,
+            ],
+            "peaks_measured_mm": standoff_recent_peaks,
+            "breath_period_s": breath_watcher.period_s,
+            "breath_spread_mm": breath_watcher.peak_spread,
+            "breath_note": (
+                "breath_period_s is the period actually detected, against the configured "
+                "nominal_breath_s. They differed by 38% on 2026-09-03 (5.51s real vs 4.0s "
+                "nominal), which is why the peak is now measured over counted breaths rather "
+                "than over min_breaths*nominal_breath_s seconds. breath_spread_mm is the "
+                "subject's own breath-to-breath variation over the accepted measurement, and "
+                "is the floor on how tightly standoff can position: a tolerance below it "
+                "cannot be met reliably at any seating."
+            ),
             "settled_peak_note": (
                 "settled_peak_mm is the breathing PEAK measured over a full window with the base "
                 "stationary and settled (two consecutive windows agreeing within --standoff-tol-mm) "
@@ -1101,6 +1333,8 @@ def main() -> int:
             "amplitude_tol_mm": args.amplitude_tol_mm,
             "standoff_coarse_fraction": args.standoff_coarse_fraction,
             "standoff_tol_mm": args.standoff_tol_mm,
+            "standoff_max_steps": args.standoff_max_steps,
+            "allow_loaded_tare": args.allow_loaded_tare,
             "stable_increments": args.stable_increments,
             "max_seat_increments": args.max_seat_increments,
         },

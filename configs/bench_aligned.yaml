@@ -27,11 +27,26 @@ fs: 127.0
 # OptiTrack recordings. That needs run_approach_and_seat.py --record-s 180 (its new default);
 # a 60s hold only affords ~6 refits and Q comes out noisy.
 calib_seconds: 90.0
-# The MEASURED sensor lag (session 007, cross-correlation of tactile against the phantom's
-# real position). Forecasting by exactly this should put the estimate back on top of where
-# the phantom is *now*, cancelling the delay -- which is the one claim this whole pipeline
-# exists to support, and the reason this is not a round number.
-horizon: 0.677
+# A FALLBACK, only used when this config is run by hand (ct-pipeline). plot_approach_and_seat
+# overrides it with a horizon assembled from the run being plotted.
+#
+# It used to be 0.677 -- session 007's measurement, then frozen and reused for every later
+# run. It does not transfer, for two reasons found in session 013:
+#
+#   1. Most of it was never sensor latency. The ToF is non-contact but shares the bus, the
+#      tick loop and the motion, and it lags 0.014-0.100s where the tactile arm lags
+#      0.279-0.566s. The difference is viscoelastic settling in the CONTACT.
+#   2. That contact term is not constant. It tracks how hard the arm is seated (+0.63
+#      correlation with seat depth), so one number cannot be right for two runs.
+#
+# 0.677 also included the phantom motor's own ~0.05s tracking lag: it came from the one run
+# on disk with no measured_mm, so it was scored against commanded_mm.
+#
+# Forecasting by the WHOLE sensing lag is still the right thing -- it is what puts the
+# estimate back on top of where the phantom is now -- but it has to be this run's lag. On
+# run 20260902-160517 (real lag 0.279s), forecasting at 0.677s scores WORSE than not
+# forecasting at all: 0.4135mm RMSE against 0.3095mm for reading the sensor late.
+horizon: 0.30
 seed: 0
 
 source:
@@ -67,9 +82,27 @@ identifier:
     # which would make this one line obsolete.
     R_override: 7.3e-6
     p0_inflation: 2.0
+    # session 015 measured q_scale=0.5 fixing frequency lock on ONE run (20260903-171153).
+    # session 016 then found a SECOND trial of the same profile broke lock at every q_scale
+    # from 0.1-5.0, including this one -- q_scale alone does not generalize.
+    #
+    # session 018's real sweep (5 profiles x 2 valid trials each, 10 runs total, see
+    # docs/sessions/018-2026-09-04-real-sweep-results.md) confirms it: q_scale=0.5 with no
+    # omega_bounds locks only 2 of these 10 real runs. It is the PAIR with
+    # tracker.params.omega_bounds_fraction below that is validated -- q_scale=0.5 +
+    # omega_bounds_fraction=0.1 is the only setting tested that keeps lock on all 10
+    # (mean forecast RMSE 0.293mm). Do not trust q_scale in isolation again.
+    q_scale: 0.5
 
 tracker:
   name: harmonic_ekf
   params:
     joseph: true
     wrap_phases: true
+    # Resolved at runtime to an absolute omega_bounds = bpm_to_omega(stage1_rate) * (1+-0.1)
+    # (see ct.run.resolve_tracker_params) -- a fixed rad/s range can't generalize across the
+    # 10-22bpm spread of real subjects this was tested on, only a bound relative to THIS run's
+    # own Stage-1 rate can. Validated in the same 10-run sweep as q_scale above: this is the
+    # one setting, of q_scale x omega_bounds combinations tested, that kept frequency lock on
+    # every run.
+    omega_bounds_fraction: 0.1
