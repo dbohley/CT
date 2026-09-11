@@ -195,6 +195,17 @@ land in `outputs/<name>/`, alongside the resolved config that produced them.
 
 See [README.md](README.md) for worked examples of each.
 
+Bench scripts for the live needle-insertion work (session 022) are plain
+`python scripts/...` rather than `ct-*` entry points:
+
+| Script | Purpose |
+|---|---|
+| `run_approach_and_seat.py --insert-needle` | the real thing: approach, seat, standoff, calibrate an EKF, then gated breakthrough + advance |
+| `generate_sinusoid_profile.py` | synthetic sinusoid in the phantom driver's `time_s,y_mm` format (`ct-generate` writes `t,y`, which the driver cannot read) |
+| `slice_breathing_profile.py` | trailing-window slice of a real profile — `run_breathing_profile.py` loops the *whole* file, so "the last 300s" needs a real slice |
+| `plot_approach_and_seat.py` | run figure; marks gate-fire vs. actual drive start and shades where the needle is not floating |
+| `plot_needle_gating_timing.py` | offline gate-fire vs. activation diagnostic across sinusoid/moira/emma |
+
 ### Real subject data
 
 `unfiltered_data/` holds the raw OptiTrack takes (read-only; large). Each is a 70-column
@@ -616,6 +627,155 @@ not really produced is worse than no session doc.
   stationary, so it is subject-dependent — a calibration-window stationarity guard is worth
   considering.
 
+### From the needle plant characterization (session 019)
+
+- **The forecast horizon's `tau_cl(omega_r)` may be computed against the wrong closed-loop
+  architecture.** `ct.control.states.insert._hold_standoff()` commands `reference_mm +
+  correction` — feedforward plus feedback, by its own docstring — not `correction` alone, but
+  `ct.control.servo`'s `closed_loop_response()`/`residual_lag()` compute the standard
+  unity-feedback `T=L/(1+L)`. The real architecture's transfer function is algebraically
+  `G(1+C)/(1+GC)`, not `GC/(1+GC)`. Simulating the actual `LeadServo` in its real loop
+  (`scripts/simulate_needle_lead_tracking.py`) against the measured plant found an 18%
+  amplitude and ~50% lag discrepancy from `closed_loop_response()`'s prediction at the same
+  frequency, matching that derivation's estimated ratio (`1+1/|C(jw)| ≈ 1.22` there, observed
+  1.18). Not yet fixed — this touches a formula every past session's `tau_cl` conclusion has
+  used, and deserves its own dedicated investigation rather than a fix folded into an unrelated
+  session.
+- **A phase's timing budget must be sized from what it needs to do, not copied from a sibling
+  phase.** `run_needle_step_response.py`'s retract phase reused the step phase's fixed
+  duration; whenever the step's commanded velocity exceeded the retract velocity's capacity in
+  that same window, the retract silently ran out of time and the *next* rep started mid-reversal
+  instead of from rest — fully explaining a batch of fits that had degenerated to `wn≈300 rad/s,
+  zeta≈0.026`. Fixed by sizing the budget from measured travel and confirming arrival from
+  telemetry, the same "never dead-reckon, judge arrival from the motor's own replies" principle
+  sessions 005 and 009 already established for other phases.
+- **A GL-II motor's own `motor_velocity_rad_s` reply field cannot be trusted at its documented
+  decode range.** Read 6.7-8.5x the commanded velocity limit across every needle-motor run this
+  session, consistently enough to be systematic rather than noise — consistent with
+  `listen_needle_motor.py`'s already-documented caution that the GL-II manual is internally
+  inconsistent about "rad/s" vs "r/s" for this exact field. Not fixed at the source (the range
+  constant is shared by four scripts); worked around by differentiating position instead.
+- **Only the very first commanded step since a process connects fits cleanly; every later rep in
+  a back-to-back sequence does not, and not always in the same way.** True even after the
+  retract-timing bug above was fixed and confirmed (`retract_arrived: True` throughout) — one
+  run's later reps pegged `zeta` against its upper bound, a different run's pegged it against
+  the lower bound instead. Mechanism unknown; not chased further per this session's explicit
+  "helps a little, doesn't need to be perfect" scope. The measured plant
+  (`K=0.92, wn=27.0, zeta=0.35` in `configs/rig_bench.yaml`) is the mean of four independent
+  clean ("first command") trials only.
+
+### From in-tissue needle identification (session 020)
+
+- **The only-first-rep-fits-cleanly mystery (session 019) is confirmed medium-independent, and
+  two specific causes are now ruled out.** Reproduced identically in tissue, which rules out
+  tissue creep/relaxation as the cause (nothing to creep in free air, where it was first seen).
+  Resending `CLEAR_ERRORS`+`ENTER_MODE` before every rep (not just once per run) also failed to
+  fix reps 1+ — they stayed degenerate, just with a different failure signature (`zeta` pegged
+  low with `wn`~300 this time, vs. `zeta` pegged high with `wn`~80-230 in session 019) — so a
+  stale mode-entry state is ruled out too. Root cause remains unknown; the practical fix is
+  collecting more independent single-command trials, not more reps per invocation.
+- **Even the "reliable" condition isn't immune to outliers, and small samples can look like real
+  effects when they aren't.** 1 of 10 independent cold-start trials landed ~30 standard
+  deviations from the other nine (`wn=138` vs. a 22-35 cluster) — a categorical outlier, not a
+  borderline call. And the first in-tissue attempt (n=4) suggested `wn` was meaningfully higher
+  in tissue than free air (39.2 vs 27.1) — collecting 10 trials instead of 4 converged the
+  estimate back to 27.2±3.7, matching free air almost exactly. **The apparent tissue effect was
+  a small-sample noise artifact.** At the tested velocity/excursion, tissue contact does not
+  measurably change this axis's identified dynamics — `configs/rig_bench.yaml` was left
+  unchanged.
+- **A user-supplied mass cannot produce an independent second plant estimate from the same
+  step-response data, and this generalizes**: solving `wn=sqrt(k/m)`, `zeta=b/(2sqrt(km))` for
+  `k`/`b` using an already-measured `wn`/`zeta`, then recombining them, returns the identical
+  `wn`/`zeta` — mass cancels out algebraically. Relabeling a measurement through an invertible
+  parameter transform is not a second, independent measurement of anything, regardless of what
+  physical quantity is used to do the relabeling. Worth remembering the next time someone
+  proposes cross-checking a fit "a different way" using only information already used to
+  produce it.
+
+### From lead compensator hardware validation (session 021)
+
+- **The session-019 lead compensator (gain=12.74, unmodified) gives a real, measured tracking
+  improvement on real hardware — but only once tested at the rate it was actually designed for.**
+  A live A/B test (`scripts/run_needle_lead_tracking_live.py`) at the bench script's default
+  20Hz command rate oscillated badly; at 100Hz it was much better but the compensator still
+  slightly hurt (0.0762 vs 0.0667mm RMSE, −14.3%); at 200Hz — `configs/rig_bench.yaml`'s actual
+  `procedure.loop_rate_hz` — the same unmodified compensator gave a genuine improvement (0.0466
+  vs 0.0502mm RMSE, +7.2%, zero saturation). **A bench test's command rate is not a neutral
+  parameter**: real axis tracking lag against the same reference measured 0.139mm std at 20Hz,
+  falling to an RMSE of 0.0667mm at 100Hz and 0.0502mm at 200Hz — an unrepresentative rate can
+  dominate the very thing being measured, and can make a working design look broken.
+- **A plausible root-cause theory that produces a number in the wrong ballpark should be
+  dropped, not rationalized.** Suspected the compensator's ~12.7x high-frequency gain was
+  amplifying real position-*sensor* noise; measured it directly
+  (`scripts/measure_needle_position_noise.py`) and it came back tiny (0.005mm at rest,
+  projecting to only ~0.096mm of correction noise) — nowhere near the multi-millimetre
+  corrections observed. The real driver, confirmed from the *uncompensated* phase of the same
+  run, was dynamic tracking lag (0.139mm std) from the axis chasing a reference that only
+  updated 20 times a second — a different quantity than sensor noise, 30x larger, and the actual
+  explanation.
+- **A magnitude-only clamp on a compensator's correction is not sufficient protection against a
+  sudden or coarse-rate-driven error; a genuine rate limit on the correction itself is a
+  materially different safeguard, not a redundant one.** `LeadServo.update()` gained
+  `rate_limit_mm_s`, chained after the existing magnitude clamp, both now defaulting from new
+  `AxisServoConfig` fields rather than being passed in per call site — the same units confusion
+  that caused the bug below happened specifically because the old design required each call
+  site to remember which value meant what.
+- **A units bug had been live in production control code since it was written**: `_hold_standoff()`
+  reused `ctx.geometry.needle.v_max_mm_s` (mm/s, a genuine velocity ceiling used correctly
+  elsewhere) as `LeadServo.update()`'s magnitude clamp (mm, a position). Never caught by
+  simulation, which has no real measurement lag of the kind that exposed it here. Fixed, and the
+  compensator extended from `_hold_standoff()` alone into `AdvanceState`'s increments and
+  `InsertState._drive()` at the user's explicit direction (its job is general tracking fidelity,
+  not standoff-specific) — not yet validated on real hardware, only in simulation via the full
+  test suite.
+
+### From needle actuation on hardware (session 022)
+
+- **The gate fires on `forecast(t + h)`, so anything that tests `value(t)` against the same band
+  is structurally inconsistent with it.** During a descent `value(t)` is always above
+  `forecast(t + h)` — that gap *is* the horizon. So `advance_drive`'s old inhale abort tripped the
+  instant a drive started whenever `inhale_abort_frac` sat below wherever `value(t)` happened to
+  be at fire time: never at 0.85, in 6ms at 0.25. **No threshold value fixes this**, and it
+  presents convincingly as a tuning problem. Replaced with a model-free rule on the raw sensor —
+  reference the reading at drive start, require a descent of `--abort-margin-mm` to arm, float
+  when it returns to that reference — which is symmetric about the trough by construction and
+  assumes no waveform, in `advance_abort_decision()`.
+- **Pausing the tracker across a needle drive is far worse than feeding it the drive's data, and
+  the premise for pausing was never true.** The raw tactile signal is clean straight through both
+  drives (breakthrough: `5.76 → 3.99` trough `→ 8.40` peak; advance: `5.02 → 3.68 → back`). The
+  pause instead produced gaps up to **6.1s (1.5 breaths)**, after which tracked `omega_r` was
+  observed at roughly half the true rate and antiphase — so the gate fired a drive at **peak
+  inhale** while believing it was firing at end-exhale. Feeding continuously took the largest
+  single `step()` dt from 6.09s to 0.045s and model-vs-sensor error from 4.1mm (antiphase) to
+  0.231mm mean. **Why omega collapsed is still unexplained** — a Q-scales-with-dt explanation was
+  proposed and *not* confirmed by replay.
+- **`scripts/run_approach_and_seat.py` had never adopted `omega_bounds`**, despite session 018
+  establishing it as the thing that holds frequency lock 10/10 on real runs. Now wired via
+  `ct.run.resolve_tracker_params()`. It binds at exactly ±10% in replay and costs a few percent of
+  rate accuracy against an unclamped filter that happened to recover — worth it, because the gate
+  fires on model *phase* and a 44%-off collapse is unrecoverable.
+- **Frequency collapse is silent and total.** Every other signal looked healthy — `y_pred` fit,
+  aborts carried plausible reasons, the sequence completed. Only `tracked_omega_r`, sitting unread
+  in the telemetry, showed it. There is now a warning and `omega_stage1`/`omega_tracked_min|max`
+  in the summary.
+- **A wrong `dt` through this model returns plausible, in-range numbers.** `theta` only enters via
+  `sin`/`cos`, so `dt = -1.2e6 s` (from mixing rebased `elapsed` with raw-monotonic `tracker.t`,
+  which is what the CAN mailbox stamps) still produced values inside the correct amplitude band —
+  phase-aliased nonsense that looks like data. Bounded and believable is not correct.
+- **The re-arm sleeps were dead weight.** `0.1s` after `CLEAR_ERRORS` and `0.5s` after
+  `ENTER_MODE`, copied into every script doing that handshake, never justified by any datasheet or
+  measurement. `--rearm-sleep-s 0.0` runs clean on hardware. The `drive_started_at − fired_at` gap
+  measured in earlier runs was never independent evidence — it was those same sleeps read back.
+- **A backstop that can fire before the primary rule arms is not a backstop.** The retired model
+  check, left wired as a parallel `or`, went on deciding every abort because the bench command
+  line still passed it a value. Retired flags should warn and do nothing, not stay live.
+- **Replay the shipped function, not a re-implementation of it.** The failure above was "a
+  different rule fired", which a hand-written replay structurally cannot detect. The abort rule is
+  now a pure function called by both the control loop and the offline check.
+- **The sensor's CAN payload changed** when the Teensy was reflashed: `struct("<Hfh")` (uint16
+  ToF, float32 dist_cm, int16 angle) → `struct("<ff")` (float32 ToF mm, float32 dist_cm). The
+  angle field was dead downstream — decoded and logged at five sites, read by none.
+
 ## Open questions
 
 Carried forward; update rather than rediscover.
@@ -625,6 +785,41 @@ than here — that list is machine-checked and generates
 [docs/unknowns.md](docs/unknowns.md). What remains below is the part no config key can
 capture.
 
+- **Why did tracked `omega_r` collapse to roughly half the true rate after a paused-tracker gap?**
+  (Session 022.) Observed directly in run 7 (1.7497 → 0.932 rad/s across one catch-up step, ending
+  at 0.876 against a true 1.5647, antiphase, firing a drive at peak inhale). A
+  Q-scales-with-`dt` explanation — a ~6s gap inflating `P` ~230x so one measurement rewrites
+  `omega` rather than `theta` — was proposed and **not confirmed**: a faithful replay reproduced
+  the drift up to 1.76 rad/s but not the collapse. The fix (no gaps + `omega_bounds`) bounds the
+  failure regardless of mechanism, so this is not blocking, but the mechanism is unknown and may
+  bite somewhere the clamp does not reach.
+- **Does the raw-sensor symmetric-return abort hold on non-sinusoidal profiles?** (Session 022.)
+  It assumes no waveform by design, which is the reason to expect it to — but it has only run
+  against the synthetic sinusoid. Moira and emma are the test.
+- **`--max-advance-drive-s 3.0` and `--abort-margin-mm 0.2` are unvalidated first guesses**,
+  in the same status `exhale_band_frac` held before it had real data behind it.
+
+- **Does `tau_cl(omega_r)`/`residual_lag()` need to account for the real feedforward+feedback
+  architecture `_hold_standoff()` actually uses, and if so, by how much has every past
+  session's `tau_cl` number been off?** (Session 019.) The current formula assumes standard
+  unity feedback; the real control code commands `reference + correction`, which is
+  algebraically a different closed loop. Needs a dedicated session: re-derive the transfer
+  function for `u = r + C(r-y)`, decide whether `ct.control.servo` should expose it as the
+  default, and check whether it changes any past forecast-horizon conclusion materially.
+- **Whether the compensator's extension into `AdvanceState`'s increments and `InsertState
+  ._drive()` (session 021) actually behaves on real hardware.** Validated only in simulation via
+  the full test suite so far; the live A/B test that found and resolved the 20Hz-vs-200Hz
+  oscillation only exercised `_hold_standoff()`'s continuous-tracking case. A fixed-target step
+  command has a different initial-error shape (large and instantaneous, not building up
+  gradually) that could plausibly trigger oscillation differently — needs its own `ct-rig`
+  hardware check, not an inference from the standoff-hold result.
+- **`configs/rig_bench.yaml`'s `servo.needle.correction_rate_limit_mm_s` placeholder (10.0)
+  does not match the value actually validated on real hardware at 200Hz (5.0, session 021's
+  bench-script default).** Both are still PLACEHOLDER in `unknowns.py`; needs a deliberate test
+  (not a guess) before either is promoted to measured. Session 022 added a *separate*
+  `NEEDLE_INSERTION_SERVO_CONFIG` (10.0mm / 40.0mm/s) for the large step insertions, because the
+  standoff-tracking clamps saturated 77 and rate-limited 294 of ~600 drive ticks — those two are
+  also first guesses, and are deliberately distinct from the tracking servo's.
 - Sensor modality and its real measured latency (optical ~10-30 ms vs ultrasound ~50-150 ms).
   `ct-compare` measures it directly once both rigs run. The optical takes in
   `unfiltered_data/` carry no synchronised second clock, so they do **not** settle `tau_s`.
@@ -673,9 +868,14 @@ capture.
 - **Which firmware the CubeMars motors are flashed with — resolved for needle/base as of
   session 004/005.** Both run the Gimbal Motor II Position/Velocity protocol (not MIT, not
   servo), now confirmed against the real vendor manual rather than empirically inferred.
-  ADVANCE's need for MIT-mode float on the needle is therefore not available as-is — worth
-  revisiting when ADVANCE's actual compliance requirement is designed, per session 004's
-  still-open question of why MIT mode never produced clean motion on this motor.
+  ~~ADVANCE's need for MIT-mode float on the needle is therefore not available as-is~~
+  **resolved (session 004, itself — this was carried here stale until session 022 caught it):**
+  the actual compliance requirement (needle must not stall between insertion increments) needs
+  only zero-torque disable, which the Gimbal protocol already provides identically to MIT mode
+  (the `EXIT_MODE` universal command every needle bench script already sends at cleanup). MIT
+  mode's finer-grained `kp=0, kd=small` "soft float" was never actually needed. Why MIT mode
+  never produced clean *position control* on this motor remains unexplained, but is now
+  irrelevant to floating specifically.
 - **What interface/channel the RH02 enumerates as** (`python -m can.detect_available_configs`).
   Nothing can be tried on hardware until this is settled.
 - **`forecast_variance` is still uncalibrated against realised error.** It is what the

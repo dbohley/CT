@@ -243,12 +243,32 @@ class BreathPeakWatcher:
     baseline wander (emma drifts -0.00513 mm/s), but a baseline moving as fast as the
     breathing amplitude itself would still defeat it -- roughly ten times the rate the bench
     has ever shown.
+
+    **A flat window has no scale, and the band computed from it is meaningless.** The
+    hysteresis band is a fraction of the *observed* amplitude, so a window that happens to
+    contain only a plateau makes the band vanish and sensor jitter alone segments "breaths".
+    Real subject profiles pause at end-exhale and end-inhale; a sinusoid never does, which is
+    why this survived the sinusoid bench and broke on the first moira run. Measured there
+    (``outputs/needle_gating_live/moira/1``): two of seven standoff measurements reported two
+    completed breaths in **0.3 s and 0.6 s**, with per-breath peaks agreeing to 0.0034 mm, from
+    windows whose first eight samples spanned 0.006-0.008 mm and so gave a band of 0.0009 mm.
+    Those two readings (6.124 and 6.492 mm, against real peaks near 8.6-10.9) were what made
+    the standoff loop oscillate and exhaust its steps -- it had been 0.09 mm from accepting.
+
+    Two guards, both weak priors rather than tuning constants: a breath shorter than
+    ``min_breath_s`` is faster than any human breathing and is discarded, and a window whose
+    amplitude is under ``min_amplitude_mm`` is not segmented at all (that floor sits ~15x above
+    this sensor's measured rest noise of 0.002-0.014 mm, session 012, and ~20x below a real
+    breathing excursion).
     """
 
     def __init__(self, n_breaths: float = 2.0, hysteresis_fraction: float = 0.15,
-                 reference_window_s: float = 30.0) -> None:
+                 reference_window_s: float = 30.0, min_breath_s: float = 1.0,
+                 min_amplitude_mm: float = 0.2) -> None:
         self.n_breaths = max(1, int(n_breaths))
         self.hysteresis_fraction = float(hysteresis_fraction)
+        self.min_breath_s = float(min_breath_s)
+        self.min_amplitude_mm = float(min_amplitude_mm)
         # The crossing level and the hysteresis band are computed over a trailing window, not
         # over everything seen. Against the whole history any base motion in the record --
         # even one step -- inflates max-min far past the breathing amplitude, the band grows
@@ -291,10 +311,19 @@ class BreathPeakWatcher:
         amplitude = float(values.max() - values.min())
         band = self.hysteresis_fraction * amplitude
 
+        # Nothing here is breathing yet. Segmenting against a band derived from a plateau is
+        # how jitter becomes "breaths" -- see the class docstring's moira measurements.
+        if amplitude < self.min_amplitude_mm:
+            return
+
         if self._above:
             if y < mean - band:
-                # Breath complete: bank its peak and wait for the next upward crossing.
-                if self._current_peak is not None and self._current_start is not None:
+                # Breath complete: bank its peak and wait for the next upward crossing --
+                # unless it was too short to be one. At 1.0s that is 60 breaths/min, faster
+                # than any real subject, so a "breath" under it is a segmentation artifact and
+                # is dropped rather than averaged into the peak.
+                if (self._current_peak is not None and self._current_start is not None
+                        and (t - self._current_start) >= self.min_breath_s):
                     self._peaks.append(self._current_peak)
                     self._starts.append(self._current_start)
                 self._current_peak = None

@@ -124,20 +124,44 @@ class LeadServo:
         self._u_prev = 0.0
         self._y_prev = 0.0
         self.saturated = 0
+        self.rate_limited = 0
 
     def reset(self, u0: float = 0.0, y0: float = 0.0) -> None:
         """Clear the filter memory. Called on entering a state that uses the servo."""
         self._u_prev = float(u0)
         self._y_prev = float(y0)
 
-    def update(self, error: float, limit: float | None = None) -> float:
-        """One step. ``error`` is reference minus measurement; returns the correction."""
+    def update(
+        self, error: float, limit: float | None = None, rate_limit_mm_s: float | None = None
+    ) -> float:
+        """One step. ``error`` is reference minus measurement; returns the correction.
+
+        ``limit`` bounds the correction's magnitude; ``rate_limit_mm_s`` separately bounds
+        how much it may change from the *previous* call, in the correction's own units per
+        second (millimetres, despite the name inherited from the velocity-limit call sites —
+        see ``ct.hw.config.AxisServoConfig``). Neither is optional in spirit for a real
+        control loop: a magnitude clamp alone still lets a large step error produce a full-size
+        correction in one tick, which is exactly the failure mode a lead compensator's zero
+        is prone to on a sudden error. Both default to the values baked into ``self.config``
+        at construction, so a call site that just does ``update(error)`` gets the configured
+        safety envelope automatically rather than needing to remember (or mis-remember) one.
+        """
+        if limit is None:
+            limit = self.config.correction_limit_mm
+        if rate_limit_mm_s is None:
+            rate_limit_mm_s = self.config.correction_rate_limit_mm_s
+
         y = (self._b0 * error + self._b1 * self._u_prev - self._a1 * self._y_prev) / self._a0
         if limit is not None and abs(y) > limit:
             # Clamp the *output* but store the clamped value as the state, so the filter
             # cannot wind up a history it will never work off.
             y = float(np.clip(y, -limit, limit))
             self.saturated += 1
+        if rate_limit_mm_s is not None:
+            max_step = rate_limit_mm_s * self.Ts
+            if abs(y - self._y_prev) > max_step:
+                y = float(np.clip(y, self._y_prev - max_step, self._y_prev + max_step))
+                self.rate_limited += 1
         self._u_prev = float(error)
         self._y_prev = y
         return y
@@ -156,6 +180,7 @@ class LeadServo:
             "alpha": self.config.lead.alpha,
             "bandwidth_rad_s": bandwidth(self.config),
             "saturated_steps": self.saturated,
+            "rate_limited_steps": self.rate_limited,
         }
 
     def __repr__(self) -> str:

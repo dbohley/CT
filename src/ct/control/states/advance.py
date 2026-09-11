@@ -58,6 +58,9 @@ class AdvanceState(BaseState):
         )
         ctx.base.hold()
         self._float(ctx)
+        # ADVANCE otherwise inherits whatever filter state INSERT's drive-to-target left
+        # behind -- a different regime again (see InsertState._wait_and_track's own reset).
+        ctx.servo.reset(u0=0.0, y0=0.0)
         ctx.log(
             "advance_enter",
             {"total_depth_mm": cfg.total_depth_mm, "increment_mm": cfg.increment_mm},
@@ -126,7 +129,10 @@ class AdvanceState(BaseState):
         self.moving = True
         self.increments += 1
         self.increment_times.append(ctx.state.t)
-        ctx.needle.move_to(target, v_max_mm_s=cfg.increment_speed_mm_s)
+        # Each increment is its own independent step command -- reset so no leftover
+        # correction from a previous increment (or from floating) carries into this one.
+        ctx.servo.reset(u0=0.0, y0=0.0)
+        self._drive_to_target(ctx, target, cfg.increment_speed_mm_s)
         ctx.log(
             "advance_increment",
             {**decision.to_dict(), "n": self.increments, "step_mm": step,
@@ -134,11 +140,21 @@ class AdvanceState(BaseState):
         )
         return None
 
+    def _drive_to_target(self, ctx: ProcedureContext, target: float, v_max_mm_s: float) -> None:
+        """Feedforward+feedback move to a fixed target -- same pattern as
+        InsertState._drive()/_hold_standoff(): the compensator supplies the correction for
+        whatever the axis has not managed to follow."""
+        error = target - ctx.state.needle_mm
+        correction = ctx.servo.update(error)
+        command = target + correction
+        lo, hi = ctx.geometry.needle.travel_mm
+        command = min(max(command, lo), hi)
+        ctx.needle.move_to(command, v_max_mm_s=v_max_mm_s)
+
     def _finish_increment(self, ctx: ProcedureContext) -> Transition | None:
         """Hold the commanded position briefly, then release back to float."""
         assert self.target_needle_mm is not None
-        ctx.needle.move_to(self.target_needle_mm,
-                           v_max_mm_s=ctx.config.advance.increment_speed_mm_s)
+        self._drive_to_target(ctx, self.target_needle_mm, ctx.config.advance.increment_speed_mm_s)
 
         cfg = ctx.config.insert
         arrived = self._arrived(ctx, ARRIVAL_TOL_MM, cfg.stall_velocity_mm_s,

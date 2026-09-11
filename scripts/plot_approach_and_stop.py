@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plot a run recorded by scripts/run_approach_and_stop.py.
 
-Reads samples.jsonl (t, tof_mm, dist_cm, angle_deg, in_contact, and -- if the motor
+Reads samples.jsonl (t, tof_mm, dist_cm, in_contact, and -- if the motor
 actually replied, still unconfirmed -- motor_position_rad) via
 ct.rt.telemetry.load_jsonl/to_arrays and the sibling summary.json, and renders a figure:
 the tactile/encoder signal (with the contact threshold marked) on top, standoff distance

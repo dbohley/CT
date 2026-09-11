@@ -215,8 +215,31 @@ latency:
 
 servo:
   needle:
-    # UNKNOWN -- both blocks. Identify the plant from a step response on the real needle
-    # axis, then design the lead against it rather than hand-tuning. tau_cl comes out of
-    # the resulting closed loop, so a wrong plant here means a wrong forecast horizon.
-    plant: {K: 1.0, wn: 60.0, zeta: 0.7}
-    lead: {zero: 8.0, pole: 80.0, gain: 150.0}
+    # Measured 2026-09-05 (docs/sessions/019) via scripts/run_needle_step_response.py +
+    # scripts/fit_needle_plant.py: mean of 4 independent from-rest steps at 0.15rad/s
+    # (3 cold-start trials + the first rep of a 5-rep batch) -- the only fits that weren't
+    # degenerate. wn/K are tight across trials (~3% spread); zeta is noisier (~33% spread,
+    # reported mean below). A repeated within-batch pattern (every rep after the first in a
+    # back-to-back sequence fits degenerate, boundary-pegged parameters even once a separate
+    # retract-timing bug was fixed) is not understood and only the from-rest fits are used.
+    # One less-certain point at 0.30rad/s suggested wn roughly doubles with amplitude
+    # (unconfirmed, n=1) -- not incorporated here. Provisional: real and far closer to the
+    # truth than the placeholder it replaces, not a finished characterization.
+    plant: {K: 0.92, wn: 27.0, zeta: 0.35}
+    # Re-derived 2026-09-05 against the measured plant above via scripts/design_needle_lead.py
+    # (numeric sweep over zero/pole/gain using ct.control.servo's tested closed-loop functions,
+    # minimizing residual_lag() subject to phase margin >= 40deg and crossover <= 0.5*wn --
+    # replacing the old placeholder's hand-picked numbers, which were sized for wn=60 and would
+    # now cross over above this axis's actual, much lower resonance). Result: crossover
+    # 13.16rad/s (49% of wn, comfortably below it), 82.4deg margin, residual_lag 151ms at a
+    # nominal 0.25Hz breathing rate -- worse than the placeholder implied, but honest.
+    lead: {zero: 1.0, pole: 5.0, gain: 12.74}
+    # UNKNOWN -- placeholders, not yet bench-validated (session 021). correction_limit_mm caps
+    # how large the compensator's correction may get; correction_rate_limit_mm_s caps how fast
+    # it may change per tick (Ts=1/loop_rate_hz=5ms above), so a sudden error (e.g. a step
+    # command's initial error) ramps the correction in rather than applying it in one tick.
+    # 10.0 mm/s reaches the 2.0mm limit over ~0.2s (40 ticks) -- deliberately gentler than any
+    # configured move speed (drive_speed_mm_s/increment_speed_mm_s below), not yet tuned.
+    # Tune with scripts/run_needle_lead_tracking_live.py.
+    correction_limit_mm: 2.0
+    correction_rate_limit_mm_s: 10.0

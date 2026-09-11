@@ -590,6 +590,22 @@ class LeadCompensator:
 class AxisServoConfig:
     plant: PlantModel = field(default_factory=PlantModel)
     lead: LeadCompensator = field(default_factory=LeadCompensator)
+    correction_limit_mm: float | None = None
+    """Ceiling on the compensator's correction magnitude -- see LeadServo.update(). Distinct
+    from any axis's v_max_mm_s: that bounds how fast the motor chases a target, this bounds
+    how large the *extra* nudge the compensator adds on top of the reference is allowed to be.
+    Reusing a velocity number here was a real bug found in session 021 -- see docs/sessions."""
+    correction_rate_limit_mm_s: float | None = None
+    """Ceiling on how fast the correction may change between calls (rate, not magnitude).
+    Nothing enforced this before session 021; a compensator fed a sudden large error (e.g. a
+    step command) can otherwise swing its correction from ~0 to its full magnitude limit in a
+    single tick."""
+
+    def __post_init__(self) -> None:
+        if self.correction_limit_mm is not None and self.correction_limit_mm <= 0:
+            raise ValueError("correction_limit_mm must be positive if set")
+        if self.correction_rate_limit_mm_s is not None and self.correction_rate_limit_mm_s <= 0:
+            raise ValueError("correction_rate_limit_mm_s must be positive if set")
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any], name: str = "axis") -> AxisServoConfig:

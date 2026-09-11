@@ -96,7 +96,7 @@ SENSOR_CAN_CHANNEL = "/dev/cu.usbmodem20553962534B1"
 SENSOR_CAN_INTERFACE = "slcan"
 SENSOR_BITRATE = 1_000_000
 SENSOR_CAN_ID = 5
-_PAYLOAD = struct.Struct("<Hfh")  # uint16 tof_mm, float32 dist_cm, int16 angle_centideg
+_PAYLOAD = struct.Struct("<ff")  # float32 tof_mm, float32 dist_cm (angle field removed by firmware)
 # -----------------------------------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -259,13 +259,12 @@ def main() -> int:
             for _stamp, can_id, data in sensor_bus.poll():
                 if can_id != SENSOR_CAN_ID or len(data) < _PAYLOAD.size:
                     continue
-                tof_mm, dist_cm, angle_centideg = _PAYLOAD.unpack(data[: _PAYLOAD.size])
+                tof_mm, dist_cm = _PAYLOAD.unpack(data[: _PAYLOAD.size])
                 in_contact = abs(dist_cm) > args.contact_threshold_cm
                 record = {
                     "t": elapsed,
                     "tof_mm": tof_mm,
                     "dist_cm": dist_cm,
-                    "angle_deg": angle_centideg / 100.0,
                     "in_contact": in_contact,
                     "commanded_target_rad": target_rad,
                     "commanded_velocity_rad_s": args.velocity,

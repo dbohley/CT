@@ -89,6 +89,14 @@ PHASE_COLORS = {
     "seat": "#ffe4c4",
     "standoff": "#c6e2ff",
     "standoff_hold": "#c6ffd8",
+    "insert_wait": "#fff2b3",
+    "insert_drive": "#ffd699",
+    "advance_wait": "#e0ccff",
+    "advance_drive": "#c9a0ff",
+    "insertion_complete": "#b3ffb3",
+    "insertion_hold": "#b3ffb3",
+    "needle_retract": "#ffb3d9",
+    "retract_complete": "#b3ffb3",
 }
 
 DEFAULT_PHASE = "standoff_hold"  # the only phase where the sensor is seated and the base is still
@@ -128,6 +136,81 @@ def _shade_phases(ax, t: np.ndarray, phases: list[str]) -> None:
             color = PHASE_COLORS.get(phases[start_i], "#eeeeee")
             ax.axvspan(t[start_i], t[i - 1] if i < len(phases) else t[-1], color=color, alpha=0.5, zorder=0)
             start_i = i
+
+
+def _mark_needle_events(ax, summary: dict) -> None:
+    """Overlay gate-fire (decision) vs. actual drive-start (activation) instants.
+
+    Reads ``summary["insertion"]`` -- ``breakthrough.{fired_at,drive_started_at}`` and
+    ``gated_advance.events[].{fired_at,drive_started_at}`` (run_approach_and_seat.py). Unlike
+    scripts/plot_needle_gating_timing.py's offline diagnostic, which adds a placeholder
+    re-arm delay to an assumed decision instant, ``drive_started_at`` here is the REAL elapsed
+    time after ``reenter_needle_mode()``'s blocking re-arm sleep actually completes -- so the
+    gap plotted is measured, not assumed.
+    """
+    insertion = summary.get("insertion") or {}
+    if not insertion.get("enabled"):
+        return
+
+    fire_label_used = False
+    activation_label_used = False
+
+    def _mark(fired_at: float | None, drive_started_at: float | None) -> None:
+        nonlocal fire_label_used, activation_label_used
+        if fired_at is not None:
+            ax.axvline(fired_at, color="C2", lw=1.2, ls="--", alpha=0.8,
+                       label="_nolegend_" if fire_label_used else "gate fires (decision)")
+            fire_label_used = True
+        if drive_started_at is not None:
+            ax.axvline(drive_started_at, color="C3", lw=1.2, ls=":", alpha=0.9,
+                       label="_nolegend_" if activation_label_used
+                       else "needle activates (measured)")
+            activation_label_used = True
+
+    # The breakthrough became abortable (and so multi-attempt) in session 023. Runs recorded
+    # before that have only the scalar keys, so fall back to them rather than silently plotting
+    # nothing for an older run's breakthrough.
+    breakthrough = insertion.get("breakthrough", {})
+    breakthrough_events = breakthrough.get("events")
+    if breakthrough_events:
+        for event in breakthrough_events:
+            _mark(event.get("fired_at"), event.get("drive_started_at"))
+    else:
+        _mark(breakthrough.get("fired_at"), breakthrough.get("drive_started_at"))
+
+    for event in insertion.get("gated_advance", {}).get("events", []):
+        _mark(event.get("fired_at"), event.get("drive_started_at"))
+
+
+def _mark_needle_floating(ax, records: list[dict], t: np.ndarray) -> None:
+    """Shade every interval where the needle is NOT floating (re-arming or driving).
+
+    Reads the per-tick ``needle_floating`` field directly (``None`` when ``--insert-needle``
+    wasn't used -- a no-op then). This is a more precise signal than the phase shading: floating
+    flips to ``False`` the instant ``reenter_needle_mode()`` is called, at the gate-fire tick --
+    not a tick later when ``phase`` becomes ``insert_drive``/``advance_drive`` -- so it captures
+    the re-arm window itself as "not floating", which the phase colors alone do not distinguish.
+    Floating is the needle's default state for nearly this whole run, so shading the rare
+    NOT-floating intervals is far less cluttered than shading floating itself.
+    """
+    floating = [r.get("needle_floating") for r in records]
+    if all(v is None for v in floating):
+        return
+
+    label_used = False
+    start_i = None
+    for i, v in enumerate(floating):
+        not_floating = v is False
+        if not_floating and start_i is None:
+            start_i = i
+        elif not not_floating and start_i is not None:
+            ax.axvspan(t[start_i], t[i - 1], color="#b30000", alpha=0.35, zorder=1,
+                       label="_nolegend_" if label_used else "needle NOT floating (re-arm + drive)")
+            label_used = True
+            start_i = None
+    if start_i is not None:
+        ax.axvspan(t[start_i], t[-1], color="#b30000", alpha=0.35, zorder=1,
+                   label="_nolegend_" if label_used else "needle NOT floating (re-arm + drive)")
 
 
 def _monotonic_origin(records: list[dict]) -> float:
@@ -646,6 +729,8 @@ def main(argv: list[str] | None = None) -> int:
     if standoff_dist_cm is not None:
         axes[0].axhline(standoff_dist_cm, color="tab:blue", lw=0.6, ls="-.", alpha=0.7, label="standoff threshold")
         axes[0].axhline(-standoff_dist_cm, color="tab:blue", lw=0.6, ls="-.", alpha=0.7)
+    _mark_needle_floating(axes[0], records, t)
+    _mark_needle_events(axes[0], summary)
     axes[0].set_ylabel("dist_cm [cm]")
     axes[0].legend(loc="upper left", fontsize=8, framealpha=0.75)
     axes[0].grid(alpha=0.3)

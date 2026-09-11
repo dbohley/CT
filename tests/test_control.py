@@ -126,6 +126,59 @@ def test_servo_output_limit_does_not_wind_up(servo_config):
     assert servo.update(-1000.0, limit=5.0) < 0
 
 
+def test_rate_limit_ramps_a_large_step_instead_of_jumping(servo_config):
+    """A sudden large error (a step command's initial error, not just a tracking disturbance)
+    must not produce a full-size correction in one tick -- that is exactly the failure mode a
+    lead compensator's zero is prone to, and what the units bug in insert.py's
+    _hold_standoff() let happen unbounded before session 021."""
+    servo = LeadServo(servo_config, Ts=0.005)
+    servo.reset()
+    max_step = 2.0 * 0.005  # rate_limit_mm_s * Ts
+    first = servo.update(1000.0, limit=1000.0, rate_limit_mm_s=2.0)
+    assert first == pytest.approx(max_step)
+    assert servo.rate_limited == 1
+
+    second = servo.update(1000.0, limit=1000.0, rate_limit_mm_s=2.0)
+    assert second - first == pytest.approx(max_step)
+
+
+def test_rate_limit_does_not_engage_when_unset(servo_config):
+    """Backward compatible: omitting rate_limit_mm_s must reproduce the pre-existing,
+    magnitude-only-clamped behavior exactly."""
+    servo = LeadServo(servo_config, Ts=0.005)
+    servo.reset()
+    servo.update(1000.0, limit=5.0)
+    assert servo.rate_limited == 0
+
+
+def test_correction_limits_default_from_config():
+    """A call site that just does update(error) -- the real control-code pattern after
+    session 021's fix -- must get config-driven limits automatically, rather than needing to
+    remember (or mis-remember, as insert.py did) the right number to pass in."""
+    config = AxisServoConfig(
+        plant=PlantModel(K=1.0, wn=60.0, zeta=0.7),
+        lead=LeadCompensator(zero=8.0, pole=80.0, gain=150.0),
+        correction_limit_mm=1.0,
+        correction_rate_limit_mm_s=2.0,
+    )
+    servo = LeadServo(config, Ts=0.005)
+    servo.reset()
+    y = servo.update(1000.0)
+    # The rate limit (0.01mm/tick here) is tighter than the magnitude limit (1.0mm) for this
+    # first tick, so it's the rate limit that ultimately bounds the output -- but both are
+    # applied in sequence (magnitude first, then rate), so a huge raw error trips both.
+    assert y == pytest.approx(2.0 * 0.005)
+    assert servo.saturated == 1
+    assert servo.rate_limited == 1
+
+
+def test_axis_servo_config_rejects_non_positive_correction_limits():
+    with pytest.raises(ValueError, match="correction_limit_mm"):
+        AxisServoConfig(correction_limit_mm=0.0)
+    with pytest.raises(ValueError, match="correction_rate_limit_mm_s"):
+        AxisServoConfig(correction_rate_limit_mm_s=-1.0)
+
+
 # -- gate ---------------------------------------------------------------------
 
 
@@ -411,6 +464,41 @@ def test_breath_peak_watcher_ignores_a_partial_breath():
     assert watcher.breaths == 1
     assert not watcher.ready
     assert watcher.peak == pytest.approx(4.0, abs=0.05)
+
+
+def test_a_plateau_of_sensor_jitter_is_not_a_sequence_of_breaths():
+    """Real subjects pause at end-exhale; a sinusoid never does.
+
+    The hysteresis band is a fraction of the window's own amplitude, so a window containing
+    only a plateau shrinks it to nothing and jitter alone segments "breaths". Taken from
+    outputs/needle_gating_live/moira/1, whose standoff loop reported two completed breaths in
+    0.6s -- peaks agreeing to 0.0034mm -- and stepped the base 2.57mm on the strength of it.
+    Values below are that run's real samples at 124Hz.
+    """
+    jitter = [6.489, 6.493, 6.495, 6.491, 6.490, 6.491, 6.491, 6.494,
+              6.490, 6.490, 6.488, 6.489, 6.488, 6.487]
+    watcher = BreathPeakWatcher(n_breaths=2)
+    for i, value in enumerate(jitter * 6):     # ~0.7s of plateau
+        watcher.add(i / 124.0, value)
+
+    assert watcher.breaths == 0
+    assert not watcher.ready
+
+
+def test_a_breath_faster_than_any_real_subject_is_discarded():
+    """60 breaths/min is the floor; anything quicker is a segmentation artifact, not a breath."""
+    t, y = _breathing([3.0] * 4, period=0.4)   # 150 breaths/min
+    watcher = BreathPeakWatcher(n_breaths=2)
+    for ti, yi in zip(t, y):
+        watcher.add(ti, yi)
+
+    assert watcher.breaths == 0
+
+    slow_t, slow_y = _breathing([3.0] * 4, period=5.0)
+    slow = BreathPeakWatcher(n_breaths=2)
+    for ti, yi in zip(slow_t, slow_y):
+        slow.add(ti, yi)
+    assert slow.ready                          # the guard must not reject real breathing
 
 
 def test_resetting_forgets_samples_from_before_a_base_move():

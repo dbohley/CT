@@ -230,3 +230,6 @@ servo:
   needle:
     plant: {K: 1.0, wn: 60.0, zeta: 0.7}
     lead: {zero: 8.0, pole: 80.0, gain: 150.0}
+    # Placeholders, not measured -- see configs/rig_bench.yaml for the rationale (session 021).
+    correction_limit_mm: 2.0
+    correction_rate_limit_mm_s: 10.0

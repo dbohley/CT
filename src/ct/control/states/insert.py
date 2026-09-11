@@ -98,10 +98,13 @@ class InsertState(BaseState):
             self.target_skin_x = skin_x
             self.notes["arrival_target_mm"] = target
             ctx.insertion_reference_skin_x = skin_x
+            # Switching from continuously tracking a moving forecast to driving toward one
+            # fixed target is a different enough regime that carrying over standoff-tracking
+            # filter state into it is wrong -- same reasoning enter()'s reset already uses.
+            ctx.servo.reset(u0=0.0, y0=0.0)
             ctx.log("insert_fired", {**decision.to_dict(), "h": h,
                                      "target_needle_mm": target, "forecast_skin_x": skin_x})
-            ctx.needle.move_to(target, v_max_mm_s=cfg.drive_speed_mm_s)
-            return None
+            return self._drive(ctx)
 
         if cfg.track_standoff:
             self._hold_standoff(ctx, h)
@@ -121,7 +124,7 @@ class InsertState(BaseState):
         reference_mm = ctx.geometry.needle_mm_for_tip_at(skin_x - standoff, ctx.state.base_mm)
 
         error = reference_mm - ctx.state.needle_mm
-        correction = ctx.servo.update(error, limit=ctx.geometry.needle.v_max_mm_s)
+        correction = ctx.servo.update(error)
         command = reference_mm + correction
 
         lo, hi = ctx.geometry.needle.travel_mm
@@ -133,7 +136,17 @@ class InsertState(BaseState):
     def _drive(self, ctx: ProcedureContext) -> Transition | None:
         cfg = ctx.config.insert
         assert self.target_needle_mm is not None
-        ctx.needle.move_to(self.target_needle_mm, v_max_mm_s=cfg.drive_speed_mm_s)
+
+        # Same feedforward+feedback pattern as _hold_standoff(): the compensator supplies the
+        # correction for whatever the axis has not managed to follow, now against a fixed
+        # target rather than a moving forecast. Arrival below is still judged against the true
+        # target, not this compensated command -- see BaseState._arrived().
+        error = self.target_needle_mm - ctx.state.needle_mm
+        correction = ctx.servo.update(error)
+        command = self.target_needle_mm + correction
+        lo, hi = ctx.geometry.needle.travel_mm
+        command = min(max(command, lo), hi)
+        ctx.needle.move_to(command, v_max_mm_s=cfg.drive_speed_mm_s)
 
         if not self._arrived(ctx, cfg.arrival_tol_mm, cfg.stall_velocity_mm_s,
                              cfg.stall_time_s):

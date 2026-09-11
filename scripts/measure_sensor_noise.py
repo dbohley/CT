@@ -44,7 +44,7 @@ from ct.hw.bus import build_bus_from_config
 from ct.hw.config import BusConfig
 from ct.rt.telemetry import TelemetryWriter, load_jsonl, to_arrays
 
-_PAYLOAD = struct.Struct("<Hfh")  # uint16 tof_mm, float32 dist_cm, int16 angle_centideg
+_PAYLOAD = struct.Struct("<ff")  # float32 tof_mm, float32 dist_cm (angle field removed by firmware)
 
 _DEFAULT_CHANNEL = "/dev/cu.usbmodem20553962534B1"  # sensor bus -- see ct.cli.sensor_bench
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -98,12 +98,11 @@ def main(argv: list[str] | None = None) -> int:
             for _stamp, can_id, data in bus.poll():
                 if can_id != args.can_id or len(data) < _PAYLOAD.size:
                     continue
-                tof_mm, dist_cm, angle_centideg = _PAYLOAD.unpack(data[: _PAYLOAD.size])
+                tof_mm, dist_cm = _PAYLOAD.unpack(data[: _PAYLOAD.size])
                 writer.write({
                     "t": time.monotonic() - t0,
                     "tof_mm": tof_mm,
                     "dist_cm": dist_cm,
-                    "angle_deg": angle_centideg / 100.0,
                 })
                 n += 1
             time.sleep(0.005)

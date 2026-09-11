@@ -35,19 +35,14 @@ def main():
                 
                 # Unpack 8 bytes payload binary structure:
                 # '<'  = Little-endian
-                # 'H'  = uint16_t (2 bytes) -> ToF Distance (mm)
-                # 'f'  = float    (4 bytes) -> Calculated Distance (cm)
-                # 'h'  = int16_t  (2 bytes) -> Scaled Angle (deg * 100)
-                tof_dist_mm, calc_dist_cm, raw_scaled_angle = struct.unpack('<Hfh', msg.data)
-                
-                # Reconstruct zeroed angle float from integer scaling
-                zeroed_angle_deg = raw_scaled_angle / 100.0
+                # 'f'  = float (4 bytes) -> ToF Distance (mm)
+                # 'f'  = float (4 bytes) -> Calculated Distance (cm)
+                tof_dist_mm, calc_dist_cm = struct.unpack('<ff', msg.data)
 
                 # Output formatted data
                 print(f"[CAN ID 5] Time: {msg.timestamp:.3f}s")
-                print(f"  ├── ToF Distance:        {tof_dist_mm} mm")
-                print(f"  ├── Calculated Distance: {calc_dist_cm:.3f} cm")
-                print(f"  └── Zeroed Angle:        {zeroed_angle_deg:.2f} deg")
+                print(f"  ├── ToF Distance:        {tof_dist_mm:.3f} mm")
+                print(f"  └── Calculated Distance: {calc_dist_cm:.3f} cm")
                 print("-" * 45)
 
     except KeyboardInterrupt:

@@ -41,7 +41,7 @@ import time
 from ct.hw.bus import build_bus_from_config
 from ct.hw.config import BusConfig
 
-_PAYLOAD = struct.Struct("<Hfh")  # uint16 tof_mm, float32 dist_cm, int16 angle_centideg
+_PAYLOAD = struct.Struct("<ff")  # float32 tof_mm, float32 dist_cm (angle field removed by firmware)
 
 # Inferred: the one usbmodem port not already tied to a motor adapter (20563976534B1 /
 # 207635764E451, see docs/sessions/004-...md) — not independently confirmed. Override
@@ -86,10 +86,10 @@ def main(argv: list[str] | None = None) -> int:
                 if len(data) < _PAYLOAD.size:
                     print(f"t={time.monotonic() - t0:6.2f}s  short frame ({len(data)} bytes), skipping")
                     continue
-                tof_mm, dist_cm, angle_centideg = _PAYLOAD.unpack(data[: _PAYLOAD.size])
+                tof_mm, dist_cm = _PAYLOAD.unpack(data[: _PAYLOAD.size])
                 touch = "TOUCH" if abs(dist_cm) > args.contact_threshold_cm else "-----"
-                print(f"t={time.monotonic() - t0:6.2f}s  ToF={tof_mm:4d}mm  "
-                      f"dist={dist_cm:7.3f}cm  angle={angle_centideg / 100:7.2f}deg  {touch}")
+                print(f"t={time.monotonic() - t0:6.2f}s  ToF={tof_mm:6.1f}mm  "
+                      f"dist={dist_cm:7.3f}cm  {touch}")
             time.sleep(0.05)
     except KeyboardInterrupt:
         pass

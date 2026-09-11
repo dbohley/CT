@@ -528,6 +528,39 @@ UNKNOWNS: tuple[Unknown, ...] = (
         blocks=(ProcedureState.INSERT,),
     ),
     Unknown(
+        key="servo.needle.correction_limit_mm",
+        units="mm",
+        what="Ceiling on the lead compensator's correction magnitude.",
+        why="Without it a large error (e.g. a step command's initial error) can drive a "
+            "full-magnitude correction in one tick. A reused velocity number stood in here "
+            "before session 021 and was wrong by two orders of magnitude and the wrong unit.",
+        how_to_measure="Run scripts/run_needle_lead_tracking_live.py and watch for saturated_steps "
+                       "in the summary against how much the correction actually needed to move; "
+                       "tighten until the compensator still helps but never demands more than "
+                       "the axis can safely absorb in one step.",
+        owner="controls",
+        placeholder=2.0,
+        blocks=(ProcedureState.INSERT, ProcedureState.ADVANCE),
+    ),
+    Unknown(
+        key="servo.needle.correction_rate_limit_mm_s",
+        units="mm/s",
+        what="Ceiling on how fast the lead compensator's correction may change between control "
+             "ticks.",
+        why="Nothing bounded this before session 021 -- only the correction's magnitude was "
+            "(mis-)limited, not its rate, so a sudden error could still swing the correction "
+            "from near zero to its full magnitude limit in a single tick. This matters more "
+            "once the compensator drives step commands (ADVANCE increments, INSERT's post-fire "
+            "drive), whose initial error is the whole step size.",
+        how_to_measure="Run scripts/run_needle_lead_tracking_live.py and check rate_limited_steps "
+                       "in LeadServo.stats against the tracking-error plot; loosen until the "
+                       "correction is no longer visibly lagging behind a step it should be "
+                       "helping with, tighten until it stops overshooting.",
+        owner="controls",
+        placeholder=10.0,
+        blocks=(ProcedureState.INSERT, ProcedureState.ADVANCE),
+    ),
+    Unknown(
         key="procedure.loop_rate_hz",
         units="Hz",
         what="Control loop rate the host can actually sustain without missing deadlines.",
