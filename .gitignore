@@ -7,3 +7,7 @@ dist/
 .pytest_cache/
 .DS_Store
 .ipynb_checkpoints/
+needle_gating_live.zip
+needle_gating_live/*
+trial_data_alt.zip
+trial_data_alt/*
